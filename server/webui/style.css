@@ -555,3 +555,18 @@ tr.pi-ticked td { background: var(--layer-hover); }
   resize: vertical;
 }
 .prompt-text:focus { outline: 2px solid var(--focus); outline-offset: -2px; }
+
+/* ---- project scope (specs/project-access) ---- */
+.scope-note { font-size: 12px; color: var(--text-helper); border: 1px solid #393939;
+  padding: 2px 8px; border-radius: 2px; white-space: nowrap; }
+.scope-editor { display: flex; flex-direction: column; gap: 10px; }
+.scope-editor .check { display: inline-flex; align-items: center; gap: 8px; font-size: 13px;
+  cursor: pointer; }
+.scope-editor .check input { margin: 0; accent-color: var(--link); }
+.scope-list { display: flex; flex-wrap: wrap; gap: 8px 20px; }
+.scope-list.muted { opacity: 0.45; }
+.scope-add { display: flex; gap: 8px; align-items: center; }
+.scope-add input { max-width: 260px; }
+.scope-row td { padding-top: 12px; padding-bottom: 16px; }
+.scope-actions { display: flex; gap: 8px; margin-top: 4px; }
+.scope-names { display: flex; flex-wrap: wrap; gap: 4px; }

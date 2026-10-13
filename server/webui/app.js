@@ -529,7 +529,8 @@ async function filtersRow(onChange, extra) {
   const projects = await apiJSON("/api/v1/projects").catch(() => []);
   wrap.innerHTML = `
     <div class="field"><label class="microlabel">Project</label>
-      <select id="f-project"><option value="">all projects</option>
+      <select id="f-project"><option value="">${Array.isArray(state.me.scope)
+        ? "all my projects" : "all projects"}</option>
         ${projects.map((p) => `<option ${p === state.filters.project ? "selected" : ""}
           value="${esc(p)}">${esc(p)}</option>`).join("")}
       </select></div>
@@ -916,6 +917,9 @@ async function viewKeys() {
   create.className = "card";
   create.innerHTML = `
     <div class="card-head"><span class="card-title">Issue a key</span></div>
+    <p class="helper-text" style="margin-bottom:16px">Keys are not scoped to projects:
+      a member or admin key reads every project, whoever holds it. Project access
+      is set per account on the Users page.</p>
     <div class="form-grid">
       <div class="field"><label class="microlabel">Name (person or machine)</label>
         <input id="k-name" placeholder="alice"></div>
@@ -1519,9 +1523,80 @@ function priceImportCard(getModels, reloadPrices) {
 
 // ---------------------------------------------------------------- users
 
+// ---- project scope editor (specs/project-access AC3, AC22) ----
+
+const PROJECT_NAME = /^[A-Za-z0-9._-]{1,64}$/;
+
+/* Registered projects, projects seen in the data, and whatever the account
+   already holds — so access can be granted before the first session arrives. */
+async function offeredProjects(extra = []) {
+  // A failed fetch surfaces as an error, not as a half-empty checklist.
+  const [seen, registered] = await Promise.all([
+    apiJSON("/api/v1/projects"), apiJSON("/api/v1/projects/manage"),
+  ]);
+  return [...new Set([...seen, ...registered.map((p) => p.name), ...extra])].sort();
+}
+
+function scopeCell(u) {
+  if (u.role === "admin" || u.all_projects) return '<span class="badge ok">all projects</span>';
+  if (!u.projects.length) return '<span class="badge warn">no projects yet</span>';
+  return `<span class="scope-names">${u.projects.map((p) =>
+    `<span class="badge">${esc(p)}</span>`).join("")}</span>`;
+}
+
+function projectCheck(name, checked, disabled) {
+  return `<label class="check"><input type="checkbox" class="sc-p" value="${esc(name)}"
+    ${checked ? "checked" : ""} ${disabled ? "disabled" : ""}> ${esc(name)}</label>`;
+}
+
+function scopeEditorHtml(offered, current) {
+  const all = !!current.all_projects;
+  return `<div class="scope-editor">
+    <label class="check"><input type="checkbox" class="sc-all" ${all ? "checked" : ""}>
+      all projects — including sessions that carry no project name</label>
+    <div class="scope-list ${all ? "muted" : ""}">${offered.length
+      ? offered.map((p) => projectCheck(p, current.projects.includes(p), all)).join("")
+      : '<span class="helper-text sc-none">no projects known yet — add a name below</span>'}</div>
+    <div class="scope-add">
+      <input class="sc-new" placeholder="another project name" spellcheck="false" ${all ? "disabled" : ""}>
+      <button type="button" class="btn btn-ghost sc-add-btn" ${all ? "disabled" : ""}>add</button>
+    </div></div>`;
+}
+
+function wireScopeEditor(editor) {
+  const allBox = $(".sc-all", editor);
+  allBox.addEventListener("change", () => {
+    editor.querySelectorAll(".sc-p, .sc-new, .sc-add-btn").forEach((el) => {
+      el.disabled = allBox.checked;
+    });
+    $(".scope-list", editor).classList.toggle("muted", allBox.checked);
+  });
+  const add = () => {
+    const name = $(".sc-new", editor).value.trim();
+    if (!PROJECT_NAME.test(name)) { alert("project name: letters, digits, . _ - (max 64)"); return; }
+    const existing = [...editor.querySelectorAll(".sc-p")].find((c) => c.value === name);
+    if (existing) existing.checked = true;
+    else {
+      const list = $(".scope-list", editor);
+      list.querySelector(".sc-none")?.remove();
+      list.insertAdjacentHTML("beforeend", projectCheck(name, true, false));
+    }
+    $(".sc-new", editor).value = "";
+  };
+  $(".sc-add-btn", editor).addEventListener("click", add);
+  $(".sc-new", editor).addEventListener("keydown", (e) => { if (e.key === "Enter") add(); });
+}
+
+/* The request body the server expects: {all: true} or {projects: [...]}. */
+function readScope(editor) {
+  if ($(".sc-all", editor).checked) return { all: true };
+  return { projects: [...editor.querySelectorAll(".sc-p:checked")].map((c) => c.value) };
+}
+
 async function viewUsers() {
   if (state.me.role !== "admin") { location.hash = "#/overview"; return; }
   main.innerHTML = "";
+  const offered = await offeredProjects();
   const create = document.createElement("div");
   create.className = "card";
   create.innerHTML = `
@@ -1536,8 +1611,17 @@ async function viewUsers() {
         </select></div>
       <button class="btn btn-accent" id="u-create">Create account</button>
     </div>
+    <div id="u-scope" style="margin-top:16px">
+      <label class="microlabel">Projects this member may see</label>
+      ${scopeEditorHtml(offered, { all_projects: false, projects: [] })}
+    </div>
+    <p class="helper-text" style="margin-top:12px">A new member sees nothing until
+      granted here. API keys are not scoped: a member or admin key reads every project.</p>
     <div id="u-reveal"></div>`;
   main.appendChild(create);
+  wireScopeEditor($("#u-scope .scope-editor"));
+  $("#u-role").addEventListener("change", (e) =>
+    $("#u-scope").classList.toggle("hidden", e.target.value === "admin"));
 
   const listCard = document.createElement("div");
   listCard.className = "card";
@@ -1555,21 +1639,53 @@ async function viewUsers() {
     listCard.innerHTML = `
       <div class="card-head"><span class="card-title">Accounts</span></div>
       <div class="table-scroll"><table>
-        <thead><tr><th>Username</th><th>Role</th><th>Status</th><th>Last login</th>
-          <th>Created</th><th></th></tr></thead>
+        <thead><tr><th>Username</th><th>Role</th><th>Projects</th><th>Status</th>
+          <th>Last login</th><th>Created</th><th></th></tr></thead>
         <tbody>${users.map((u) => `<tr>
           <td style="color:var(--text-primary)">${esc(u.username)}</td>
           <td><span class="badge">${esc(u.role)}</span></td>
+          <td>${scopeCell(u)}</td>
           <td>${u.disabled_at ? '<span class="badge warn">disabled</span>'
               : u.must_change_password ? '<span class="badge">must change pw</span>'
               : '<span class="badge ok">active</span>'}</td>
           <td>${u.last_login_at ? timeAgo(u.last_login_at) : "never"}</td>
           <td>${fmtTime(u.created_at)}</td>
           <td style="text-align:right">
+            ${u.role === "admin" ? "" :
+              `<button class="btn btn-ghost u-scope" data-id="${u.id}">access</button>`}
             <button class="btn btn-ghost u-reset" data-id="${u.id}">reset password</button>
             ${u.disabled_at ? "" :
               `<button class="btn btn-ghost btn-danger u-del" data-id="${u.id}">disable</button>`}
-          </td></tr>`).join("")}</tbody></table></div>`;
+          </td></tr>
+          <tr class="scope-row hidden" data-id="${u.id}"><td colspan="7"></td></tr>`).join("")}
+        </tbody></table></div>`;
+    const byId = Object.fromEntries(users.map((u) => [String(u.id), u]));
+    listCard.querySelectorAll(".u-scope").forEach((b) =>
+      b.addEventListener("click", async () => {
+        const row = listCard.querySelector(`.scope-row[data-id="${b.dataset.id}"]`);
+        if (!row.classList.contains("hidden")) { row.classList.add("hidden"); return; }
+        const u = byId[b.dataset.id];
+        const cell = row.firstElementChild;
+        let offered;
+        try { offered = await offeredProjects(u.projects); } catch (err) { alert(err.message); return; }
+        cell.innerHTML = `<label class="microlabel">Projects ${esc(u.username)} may see</label>
+          ${scopeEditorHtml(offered, u)}
+          <div class="scope-actions">
+            <button class="btn btn-accent sc-save">Save access</button>
+            <button class="btn btn-ghost sc-cancel">cancel</button>
+          </div>`;
+        wireScopeEditor($(".scope-editor", cell));
+        $(".sc-cancel", cell).addEventListener("click", () => row.classList.add("hidden"));
+        $(".sc-save", cell).addEventListener("click", async () => {
+          try {
+            await apiJSON(`/api/v1/users/${u.id}/scope`, {
+              method: "PUT", body: JSON.stringify(readScope($(".scope-editor", cell))),
+            });
+            loadUsers();
+          } catch (err) { alert(err.message); }
+        });
+        row.classList.remove("hidden");
+      }));
     listCard.querySelectorAll(".u-reset").forEach((b) =>
       b.addEventListener("click", async () => {
         const res = await apiJSON(`/api/v1/users/${b.dataset.id}/reset`, { method: "POST" });
@@ -1590,9 +1706,11 @@ async function viewUsers() {
     const username = $("#u-name").value.trim();
     if (!username) return;
     try {
+      const role = $("#u-role").value;
       const res = await apiJSON("/api/v1/users", {
         method: "POST",
-        body: JSON.stringify({ username, role: $("#u-role").value }),
+        body: JSON.stringify({ username, role,
+          ...(role === "admin" ? {} : readScope($("#u-scope .scope-editor"))) }),
       });
       $("#u-name").value = "";
       $("#u-reveal").innerHTML = tempPwReveal(res);
@@ -1616,9 +1734,16 @@ async function route() {
   document.querySelectorAll("#nav a").forEach((a) =>
     a.classList.toggle("active", hash.startsWith(a.getAttribute("href")) ||
       (m && a.dataset.view === "sessions")));
+  const view = hash.slice(2);
+  const dataView = m || ["overview", "sessions", "projects", "export"].includes(view)
+    || !VIEWS[view];
   try {
-    if (m) await viewSession(decodeURIComponent(m[1]));
-    else await (VIEWS[hash.slice(2)] || viewOverview)();
+    if (Array.isArray(state.me.scope) && !state.me.scope.length && dataView) {
+      main.innerHTML = `<div class="card"><div class="empty"><span class="glyph">◌</span>
+        an admin has not granted you any project yet — ask an admin to grant you
+        one</div></div>`;
+    } else if (m) await viewSession(decodeURIComponent(m[1]));
+    else await (VIEWS[view] || viewOverview)();
   } catch (err) {
     if (err.message !== "unauthorized") {
       main.innerHTML = `<div class="card"><div class="empty">
@@ -1654,6 +1779,13 @@ function enterShell(me) {
   $("#login-error").textContent = "";
   $("#shell").classList.remove("hidden");
   $("#who").innerHTML = `${esc(me.name)} <span class="role">· ${esc(me.role)}</span>`;
+  const note = $("#scope-note");
+  if (Array.isArray(me.scope)) {
+    note.textContent = me.scope.length
+      ? `${me.scope.length} of the team's projects` : "no project granted yet";
+    note.title = me.scope.join(", ");
+  }
+  note.classList.toggle("hidden", !Array.isArray(me.scope));
   $("#server-version").textContent = "v" + me.version;
   $("#nav-keys").classList.toggle("hidden", me.role !== "admin");
   $("#nav-users").classList.toggle("hidden", me.role !== "admin");
