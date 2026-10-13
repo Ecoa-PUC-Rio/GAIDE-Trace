@@ -68,7 +68,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 
 # Bump whenever the rules that derive index data from stored transcripts
 # change: `serve` re-derives existing data on start (see
