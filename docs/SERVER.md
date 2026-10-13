@@ -39,7 +39,8 @@ Open `http://localhost:8321/` and sign in with the default account
 anything else works. From there, everything is managed visually:
 
 - **Users** — create accounts for the team (each gets a temporary password,
-  shown once, that must be changed on first login), reset passwords, disable.
+  shown once, that must be changed on first login), choose which projects each
+  account may see (§1.1), reset passwords, disable.
 - **Projects** — register a project; the server generates an ingest-only key
   and a ready-to-paste **install prompt** (see §2).
 - **API keys** — advanced: raw bearer keys for scripts/CI.
@@ -55,11 +56,42 @@ python3 server/gaide_trace_server.py user list
 
 Two kinds of credentials:
 
-| Credential | Who uses it | Can |
-|---|---|---|
-| username + password | humans, in the console | member: browse + export + register projects · admin: + users, keys, removals |
-| `agent` API key | hooks / install prompts | ingest only — leaked, it can add data but never read |
-| `member`/`admin` API key | scripts, CI | scripted API access (create via **API keys** or `key create`) |
+| Credential | Who uses it | Can | Sees |
+|---|---|---|---|
+| username + password | humans, in the console | member: browse + export + register projects · admin: + users, keys, removals | member: the projects granted to the account (§1.1) · admin: everything |
+| `agent` API key | hooks / install prompts | ingest only — leaked, it can add data but never read | nothing |
+| `member`/`admin` API key | scripts, CI | scripted API access (create via **API keys** or `key create`) | everything — keys are not scoped |
+
+### 1.1 Who sees what — project access per account
+
+Every console account has a **project scope**: either *all projects*, or an
+explicit list of project names. Admins always see everything. A member with a
+list sees only sessions, transcripts, aggregates, exports, registered
+projects and install prompts of the projects on that list — the server
+applies the scope to every read, so it holds for `curl` as much as for the
+console. Data outside the scope is simply absent: a session id from another
+project answers "unknown session", and a project the member may not see
+filters like a project with no data.
+
+- **Granting:** on **Users**, click *access* on a member row, tick projects
+  (registered ones and any name seen in the data are offered; type a name to
+  grant it before its first session arrives), or switch on *all projects*.
+  Changes apply on the member's next request, with no new login.
+- **Defaults:** accounts created before this feature keep *all projects*
+  (upgrading never takes access away). Accounts created from now on start
+  with **no projects** until an admin grants some — the create form has the
+  same control, so you can set it up in one step.
+- **Registering a project** adds it to the registering member's own list.
+  A member with a list cannot register a name that already carries data
+  (409), so registration never hands out access to existing sessions.
+- **Sessions without a project name** are visible only to *all projects*
+  accounts.
+- **API keys are not scoped.** A `member` or `admin` key reads every project,
+  whoever holds it — issue them knowingly. `agent` keys cannot read at all.
+- Every scope change is written to the server log with who changed whose
+  scope to what.
+
+Decision record: [ADR 0002](adr/0002-project-scope-on-accounts.md).
 
 ## 2. Connect a project
 
@@ -245,12 +277,13 @@ the login endpoint).
 
 | Method & path | Role | Purpose |
 |---|---|---|
-| `POST /api/v1/auth/login` | — | `{username, password}` → session token (+ `must_change_password`) |
+| `POST /api/v1/auth/login` | — | `{username, password}` → session token (+ `must_change_password`, `scope`) |
+| `GET /api/v1/me` | agent | who am I: `name`, `role`, `kind`, `scope` (`null` = every project, else the granted names) |
 | `POST /api/v1/auth/password` | member | change own password (required on first login) |
 | `POST /api/v1/auth/logout` | member | revoke the session |
 | `POST /api/v1/events` | agent | ingest a JSON array of event records (idempotent by `trace_id`; gzip body supported) |
 | `PUT /api/v1/transcripts/<session_id>?project=` | agent | store/replace a transcript snapshot (gzip supported) |
-| `GET /api/v1/overview?project&from&to` | member | aggregates: totals, per-day series, top tools, per-project/member, and `models` (see below) |
+| `GET /api/v1/overview?project&from&to` | member | within the caller's scope (§1.1), like every read below — aggregates: totals, per-day series, top tools, per-project/member, and `models` (see below) |
 | `GET /api/v1/sessions?project&origin&model&from&to&q&limit&offset` | member | session list; each row carries `dominant_model` and `model_count`; `model` keeps sessions where that model has at least one turn |
 | `GET /api/v1/sessions/<id>` | member | session meta + full event timeline + `models` (per-model rows) and `models_total` |
 | `GET /api/v1/models` | member | `{models, omitted}`: the 500 most-used models seen (turns, sessions, last use) plus every priced model, each with its `price` or `null`; `omitted` counts seen models beyond the 500 |
@@ -260,7 +293,8 @@ the login endpoint).
 | `GET /api/v1/export?format=jsonl\|csv&project&session&origin&event&from&to` | member | filtered event export |
 | `GET /api/v1/projects/manage`, `POST /api/v1/projects`, `POST .../<id>/rotate` | member | registered projects + install-prompt keys |
 | `DELETE /api/v1/projects/<id>` | admin | remove registration (data kept) |
-| `GET/POST /api/v1/users`, `POST .../<id>/reset`, `DELETE .../<id>` | admin | console accounts |
+| `GET/POST /api/v1/users`, `POST .../<id>/reset`, `DELETE .../<id>` | admin | console accounts; each row carries `all_projects` and `projects`; create accepts `{"all": true}` or `{"projects": [...]}` (default: none) |
+| `PUT /api/v1/users/<id>/scope` | admin | set a member's project scope: `{"all": true}` or `{"projects": ["app", "api"]}` (names: letters, digits, `.` `_` `-`, max 64, at most 200; duplicates collapse; `all` wins over `projects`); refused for admins |
 | `GET/POST /api/v1/keys`, `DELETE /api/v1/keys/<id>` | admin | raw API-key management |
 | `GET /healthz` | — | liveness |
 
