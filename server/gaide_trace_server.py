@@ -1574,6 +1574,9 @@ class Handler(BaseHTTPRequestHandler):
                         (ident["user_id"], name, utcnow(), ident["name"]))
                 db.commit()
             except sqlite3.IntegrityError:
+                # The connection's context manager would commit the key
+                # inserted above even though the registration failed.
+                db.rollback()
                 return self.send_error_json(409, "project already registered")
         self.send_json({"name": name, "agent_token": token}, 201)
 

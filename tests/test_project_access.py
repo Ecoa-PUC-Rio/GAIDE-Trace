@@ -191,6 +191,17 @@ class ScopeManagement(AccessTestCase):
                                       {"name": "research"})
         self.assertEqual(status, 201, body)
 
+    def test_a_duplicate_registration_leaves_no_orphan_key(self):
+        """Found by the verifier: the 409 path used to commit the ingest key
+        it had already inserted."""
+        with self.h.store.connect() as db:
+            before = db.execute("SELECT COUNT(*) FROM keys").fetchone()[0]
+        for who in ("all", "member_key", "admin_user"):
+            status, _ = self.h.as_role(who, "POST", "/api/v1/projects", {"name": "app"})
+            self.assertEqual(status, 409, who)
+        with self.h.store.connect() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM keys").fetchone()[0], before)
+
     def test_ac9_a_member_key_registering_touches_no_grant(self):
         status, body = self.h.as_role("member_key", "POST", "/api/v1/projects",
                                       {"name": "scripted"})
