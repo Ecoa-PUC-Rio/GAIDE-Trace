@@ -56,14 +56,25 @@ class ServerHarness:
         self.thread.join(timeout=5)
         shutil.rmtree(self.data_dir, ignore_errors=True)
 
-    def add_user(self, username, role):
-        """Create a console user and return a signed-in session token."""
+    def add_user(self, username, role, projects=None):
+        """Create a console user and return a signed-in session token.
+
+        `projects=None` gives the *all projects* scope (what every account had
+        before specs/project-access); a list, even empty, is an explicit
+        scope. Written straight to the index so tests of the scope endpoint
+        do not depend on the endpoint under test."""
         with self.store.connect() as db:
             cur = db.execute(
                 """INSERT INTO users (username, password_hash, salt, role,
-                                      must_change_password, created_at)
-                   VALUES (?,?,?,?,0,?)""",
-                (username, _PASSWORD_HASH, _PASSWORD_SALT, role, server.utcnow()))
+                                      must_change_password, created_at, all_projects)
+                   VALUES (?,?,?,?,0,?,?)""",
+                (username, _PASSWORD_HASH, _PASSWORD_SALT, role, server.utcnow(),
+                 1 if projects is None else 0))
+            for name in projects or []:
+                db.execute(
+                    """INSERT INTO user_projects (user_id, project, granted_at, granted_by)
+                       VALUES (?,?,?,?)""",
+                    (cur.lastrowid, name, server.utcnow(), "harness"))
             db.commit()
         return server.open_web_session(self.store, cur.lastrowid)
 

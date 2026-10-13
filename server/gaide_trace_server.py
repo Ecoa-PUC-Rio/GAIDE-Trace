@@ -27,6 +27,9 @@ Auth, two mechanisms:
       admin   everything
     Each project registered in the console gets its own agent key, embedded
     in a copy-paste install prompt for the team.
+  * Every console account has a project scope: all projects, or an explicit
+    list of project names. The server applies it to every read; admins and
+    member/admin keys always see everything (specs/project-access, ADR 0002).
 
 Usage:
   python3 gaide_trace_server.py serve [--host 0.0.0.0] [--port 8321] [--data DIR]
@@ -224,13 +227,23 @@ class Store:
           must_change_password INTEGER NOT NULL DEFAULT 0,
           created_at TEXT NOT NULL,
           last_login_at TEXT,
-          disabled_at TEXT
+          disabled_at TEXT,
+          all_projects INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS web_sessions (
           token_hash TEXT PRIMARY KEY,
           user_id INTEGER NOT NULL REFERENCES users(id),
           created_at TEXT NOT NULL,
           expires_at TEXT NOT NULL
+        );
+        -- Grants are by project *name*, so a registration can go and come back
+        -- without touching who may see its data (specs/project-access).
+        CREATE TABLE IF NOT EXISTS user_projects (
+          user_id INTEGER NOT NULL REFERENCES users(id),
+          project TEXT NOT NULL,
+          granted_at TEXT NOT NULL,
+          granted_by TEXT,
+          PRIMARY KEY (user_id, project)
         );
         CREATE TABLE IF NOT EXISTS projects (
           id INTEGER PRIMARY KEY,
@@ -307,6 +320,13 @@ class Store:
             db.execute("ALTER TABLE sessions ADD COLUMN dominant_model TEXT")
         if "model_count" not in cols:
             db.execute("ALTER TABLE sessions ADD COLUMN model_count INTEGER NOT NULL DEFAULT 0")
+        # v0.5 -> v0.6: accounts that predate project scopes keep seeing
+        # everything; narrowing is an explicit admin action (AC6). Guarded by
+        # the column so a later narrowing is never undone by a restart.
+        cols = {r[1] for r in db.execute("PRAGMA table_info(users)")}
+        if "all_projects" not in cols:
+            db.execute("ALTER TABLE users ADD COLUMN all_projects INTEGER NOT NULL DEFAULT 0")
+            db.execute("UPDATE users SET all_projects = 1")
         db.commit()
 
     # ---- events ingest ----
@@ -883,16 +903,71 @@ def verify_password(password: str, password_hash: str, salt_hex: str) -> bool:
 
 
 def create_user(store: Store, username: str, password: str, role: str,
-                must_change: bool):
+                must_change: bool, all_projects: bool = False, projects=(),
+                granted_by=None):
+    """Admins always get every project; a member starts with the given scope
+    (empty list by default: access is opt-in, specs/project-access AC6)."""
     pw_hash, salt = hash_password(password)
+    all_projects = all_projects or role == "admin"
     with store.connect() as db:
-        db.execute(
+        cur = db.execute(
             """INSERT INTO users (username, password_hash, salt, role,
-                                  must_change_password, created_at)
-               VALUES (?,?,?,?,?,?)""",
-            (username, pw_hash, salt, role, 1 if must_change else 0, utcnow()),
+                                  must_change_password, created_at, all_projects)
+               VALUES (?,?,?,?,?,?,?)""",
+            (username, pw_hash, salt, role, 1 if must_change else 0, utcnow(),
+             1 if all_projects else 0),
         )
+        if not all_projects:
+            db.executemany(
+                """INSERT INTO user_projects (user_id, project, granted_at, granted_by)
+                   VALUES (?,?,?,?)""",
+                [(cur.lastrowid, name, utcnow(), granted_by) for name in projects])
         db.commit()
+
+
+def user_scope(db, user_id: int, role: str, all_projects) -> "list | None":
+    """None means every project (admins, all-projects accounts); otherwise the
+    sorted names the account may see, possibly none."""
+    if role == "admin" or all_projects:
+        return None
+    return [r["project"] for r in db.execute(
+        "SELECT project FROM user_projects WHERE user_id = ? ORDER BY project",
+        (user_id,))]
+
+
+PROJECT_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+
+
+# Every scoped read expands the list into `IN (?, ...)`; keep it far below
+# SQLite's host-parameter limit so an admin cannot brick an account by
+# granting it too much.
+MAX_SCOPE_NAMES = 200
+
+
+def parse_scope(payload: dict, default=None):
+    """(all_projects, names) from {"all": true} or {"projects": [...]}.
+    `default` when the payload names neither; None when it is invalid."""
+    if payload.get("all") is True:
+        return True, []
+    names = payload.get("projects")
+    if names is None:
+        return default
+    if (not isinstance(names, list) or len(names) > MAX_SCOPE_NAMES or not all(
+            isinstance(n, str) and PROJECT_NAME_RE.match(n) for n in names)):
+        return None
+    return False, sorted(set(names))
+
+
+def scope_sql(ident, col: str):
+    """WHERE fragment + params restricting `col` to the caller's scope: nothing
+    for all projects, `col IN (...)` for a list, a false clause for an empty
+    list. Every read query goes through here (ADR 0002)."""
+    scope = ident.get("scope")
+    if scope is None:
+        return "", []
+    if not scope:
+        return "0 = 1", []
+    return f"{col} IN ({','.join('?' for _ in scope)})", list(scope)
 
 
 def set_password(store: Store, user_id: int, password: str, must_change: bool):
@@ -958,16 +1033,18 @@ def authenticate(store: Store, headers):
     if token.startswith("gts_"):
         with store.connect() as db:
             row = db.execute(
-                """SELECT u.id, u.username, u.role, u.must_change_password
+                """SELECT u.id, u.username, u.role, u.must_change_password,
+                          u.all_projects
                    FROM web_sessions s JOIN users u ON u.id = s.user_id
                    WHERE s.token_hash = ? AND s.expires_at > ?
                      AND u.disabled_at IS NULL""",
                 (hash_token(token), utcnow()),
             ).fetchone()
-        if not row:
-            return None
+            if not row:
+                return None
+            scope = user_scope(db, row["id"], row["role"], row["all_projects"])
         return {"kind": "user", "user_id": row["id"], "name": row["username"],
-                "role": row["role"],
+                "role": row["role"], "scope": scope,
                 "must_change_password": bool(row["must_change_password"])}
     with store.connect() as db:
         row = db.execute(
@@ -980,7 +1057,7 @@ def authenticate(store: Store, headers):
             db.commit()
     if not row:
         return None
-    return {"kind": "key", "name": row["name"], "role": row["role"],
+    return {"kind": "key", "name": row["name"], "role": row["role"], "scope": None,
             "must_change_password": False}
 
 
@@ -1089,7 +1166,7 @@ class Handler(BaseHTTPRequestHandler):
             ident = self.require("agent", allow_must_change=True)
             if ident:
                 self.send_json({"name": ident["name"], "role": ident["role"],
-                                "kind": ident["kind"],
+                                "kind": ident["kind"], "scope": ident["scope"],
                                 "must_change_password": ident["must_change_password"],
                                 "version": VERSION})
             return
@@ -1112,13 +1189,11 @@ class Handler(BaseHTTPRequestHandler):
 
         if m == ("GET", "/api/v1/users"):
             if self.require("admin"):
-                with self.store.connect() as db:
-                    rows = db.execute(
-                        """SELECT id, username, role, must_change_password,
-                                  created_at, last_login_at, disabled_at
-                           FROM users ORDER BY created_at""").fetchall()
-                self.send_json([dict(r) for r in rows])
+                self.send_json(self.api_users())
             return
+
+        if method == "PUT" and re.fullmatch(r"/api/v1/users/\d+/scope", path):
+            return self.api_set_scope(int(path.split("/")[4]))
 
         if m == ("POST", "/api/v1/users"):
             return self.api_create_user()
@@ -1130,8 +1205,9 @@ class Handler(BaseHTTPRequestHandler):
             return self.api_disable_user(int(path.rsplit("/", 1)[1]))
 
         if m == ("GET", "/api/v1/projects/manage"):
-            if self.require("member"):
-                self.send_json(self.api_projects_manage())
+            ident = self.require("member")
+            if ident:
+                self.send_json(self.api_projects_manage(ident))
             return
 
         if m == ("POST", "/api/v1/projects"):
@@ -1150,27 +1226,33 @@ class Handler(BaseHTTPRequestHandler):
             return self.api_put_transcript(path.split("/api/v1/transcripts/", 1)[1], q)
 
         if m == ("GET", "/api/v1/overview"):
-            if self.require("member"):
-                self.send_json(self.api_overview(q))
+            ident = self.require("member")
+            if ident:
+                self.send_json(self.api_overview(q, ident))
             return
 
         if m == ("GET", "/api/v1/projects"):
-            if self.require("member"):
+            ident = self.require("member")
+            if ident:
+                frag, params = scope_sql(ident, "project")
                 with self.store.connect() as db:
                     rows = db.execute(
-                        "SELECT DISTINCT project FROM sessions "
-                        "WHERE project IS NOT NULL ORDER BY project").fetchall()
+                        "SELECT DISTINCT project FROM sessions WHERE project IS NOT NULL"
+                        + (f" AND {frag}" if frag else "") + " ORDER BY project",
+                        params).fetchall()
                 self.send_json([r["project"] for r in rows])
             return
 
         if m == ("GET", "/api/v1/sessions"):
-            if self.require("member"):
-                self.send_json(self.api_sessions(q))
+            ident = self.require("member")
+            if ident:
+                self.send_json(self.api_sessions(q, ident))
             return
 
         if m == ("GET", "/api/v1/models"):
-            if self.require("member"):
-                self.send_json(self.api_models())
+            ident = self.require("member")
+            if ident:
+                self.send_json(self.api_models(ident))
             return
 
         if m == ("PUT", "/api/v1/models/prices"):
@@ -1184,8 +1266,9 @@ class Handler(BaseHTTPRequestHandler):
             if rest.endswith("/transcript"):
                 sid = rest[: -len("/transcript")]
                 return self.api_get_transcript(sid)
-            if self.require("member"):
-                return self.api_session_detail(rest)
+            ident = self.require("member")
+            if ident:
+                return self.api_session_detail(rest, ident)
             return
 
         if m == ("GET", "/api/v1/export"):
@@ -1295,7 +1378,10 @@ class Handler(BaseHTTPRequestHandler):
         if not ok:
             return self.send_error_json(401, "wrong username or password")
         token = open_web_session(self.store, row["id"])
+        with self.store.connect() as db:
+            scope = user_scope(db, row["id"], row["role"], row["all_projects"])
         self.send_json({"token": token, "name": row["username"], "role": row["role"],
+                        "scope": scope,
                         "must_change_password": bool(row["must_change_password"]),
                         "version": VERSION})
 
@@ -1324,7 +1410,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json({"ok": True, "token": token})
 
     def api_create_user(self):
-        if not self.require("admin"):
+        ident = self.require("admin")
+        if not ident:
             return
         payload = self._json_body()
         if payload is None:
@@ -1333,13 +1420,72 @@ class Handler(BaseHTTPRequestHandler):
         role = payload.get("role") or "member"
         if not re.fullmatch(r"[a-z0-9._-]{2,40}", username) or role not in ("member", "admin"):
             return self.send_error_json(400, "need username [a-z0-9._-]{2,40} and role member|admin")
+        scope = parse_scope(payload, default=(False, []))
+        if scope is None:
+            return self.send_error_json(400, self.SCOPE_HELP)
+        all_projects, projects = scope
         temp_password = secrets.token_urlsafe(9)
         try:
-            create_user(self.store, username, temp_password, role, must_change=True)
+            create_user(self.store, username, temp_password, role, must_change=True,
+                        all_projects=all_projects, projects=projects,
+                        granted_by=ident["name"])
         except sqlite3.IntegrityError:
             return self.send_error_json(409, "username already exists")
         self.send_json({"username": username, "role": role,
                         "temp_password": temp_password}, 201)
+
+    def api_users(self):
+        with self.store.connect() as db:
+            rows = db.execute(
+                """SELECT id, username, role, must_change_password,
+                          created_at, last_login_at, disabled_at, all_projects
+                   FROM users ORDER BY created_at""").fetchall()
+            grants = {}
+            for g in db.execute("SELECT user_id, project FROM user_projects ORDER BY project"):
+                grants.setdefault(g["user_id"], []).append(g["project"])
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["all_projects"] = r["role"] == "admin" or bool(r["all_projects"])
+            d["projects"] = [] if d["all_projects"] else grants.get(r["id"], [])
+            out.append(d)
+        return out
+
+    SCOPE_HELP = ('need {"all": true} or {"projects": [names]} '
+                  f"(letters, digits, . _ - max 64 each, at most {MAX_SCOPE_NAMES})")
+
+    def api_set_scope(self, user_id: int):
+        ident = self.require("admin")
+        if not ident:
+            return
+        payload = self._json_body()
+        if not isinstance(payload, dict):
+            return self.send_error_json(400, "invalid JSON")
+        scope = parse_scope(payload)
+        if scope is None:
+            return self.send_error_json(400, self.SCOPE_HELP)
+        all_projects, projects = scope
+        with self.store.connect() as db:
+            row = db.execute("SELECT id, username, role FROM users WHERE id = ?",
+                             (user_id,)).fetchone()
+            if not row:
+                return self.send_error_json(404, "unknown user")
+            if row["role"] == "admin":
+                return self.send_error_json(400, "admins always see every project")
+            db.execute("UPDATE users SET all_projects = ? WHERE id = ?",
+                       (1 if all_projects else 0, user_id))
+            db.execute("DELETE FROM user_projects WHERE user_id = ?", (user_id,))
+            db.executemany(
+                """INSERT INTO user_projects (user_id, project, granted_at, granted_by)
+                   VALUES (?,?,?,?)""",
+                [(user_id, name, utcnow(), ident["name"]) for name in projects])
+            db.commit()
+        # The audit trail for grants is the server log (Principle 8).
+        self.log_message("scope %s <- %s by %s", row["username"],
+                         "all projects" if all_projects else (",".join(projects) or "(none)"),
+                         ident["name"])
+        self.send_json({"username": row["username"], "all_projects": all_projects,
+                        "projects": projects})
 
     def api_reset_user(self, user_id: int):
         if not self.require("admin"):
@@ -1379,17 +1525,17 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- registered projects (visual onboarding) --
 
-    PROJECT_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
-
-    def api_projects_manage(self):
+    def api_projects_manage(self, ident):
+        frag, params = scope_sql(ident, "p.name")
         with self.store.connect() as db:
             rows = db.execute(
-                """SELECT p.id, p.name, p.created_at, p.created_by, p.agent_token,
+                f"""SELECT p.id, p.name, p.created_at, p.created_by, p.agent_token,
                           k.revoked_at AS key_revoked,
                           (SELECT COUNT(*) FROM sessions s WHERE s.project = p.name) AS sessions,
                           (SELECT MAX(last_ts) FROM sessions s WHERE s.project = p.name) AS last_ts
                    FROM projects p LEFT JOIN keys k ON k.id = p.key_id
-                   ORDER BY p.created_at DESC""").fetchall()
+                   {('WHERE ' + frag) if frag else ''}
+                   ORDER BY p.created_at DESC""", params).fetchall()
         return [dict(r) for r in rows]
 
     def api_create_project(self):
@@ -1400,10 +1546,17 @@ class Handler(BaseHTTPRequestHandler):
         if payload is None:
             return self.send_error_json(400, "invalid JSON")
         name = (payload.get("name") or "").strip()
-        if not self.PROJECT_NAME_RE.match(name):
+        if not PROJECT_NAME_RE.match(name):
             return self.send_error_json(400, "project name: letters, digits, . _ - (max 64)")
         token = new_token()
         with self.store.connect() as db:
+            # Registration self-grants (AC9), so for a scoped member a name
+            # that already carries data — registered or not, registration
+            # removed or not — is taken: otherwise registering it would hand
+            # her every session of that project.
+            if ident["scope"] is not None and db.execute(
+                    "SELECT 1 FROM sessions WHERE project = ? LIMIT 1", (name,)).fetchone():
+                return self.send_error_json(409, "project already registered")
             try:
                 cur = db.execute(
                     "INSERT INTO keys (token_hash, name, role, created_at) VALUES (?,?,?,?)",
@@ -1412,18 +1565,28 @@ class Handler(BaseHTTPRequestHandler):
                     """INSERT INTO projects (name, created_at, created_by, key_id, agent_token)
                        VALUES (?,?,?,?,?)""",
                     (name, utcnow(), ident["name"], cur.lastrowid, token))
+                # Whoever registers a project must be able to hand out its
+                # install prompt (AC9). Same transaction: a 409 grants nothing.
+                if ident["kind"] == "user" and ident["scope"] is not None:
+                    db.execute(
+                        """INSERT OR IGNORE INTO user_projects
+                           (user_id, project, granted_at, granted_by) VALUES (?,?,?,?)""",
+                        (ident["user_id"], name, utcnow(), ident["name"]))
                 db.commit()
             except sqlite3.IntegrityError:
                 return self.send_error_json(409, "project already registered")
         self.send_json({"name": name, "agent_token": token}, 201)
 
     def api_rotate_project(self, project_id: int):
-        if not self.require("member"):
+        ident = self.require("member")
+        if not ident:
             return
         token = new_token()
+        frag, params = scope_sql(ident, "name")
         with self.store.connect() as db:
-            row = db.execute("SELECT * FROM projects WHERE id = ?",
-                             (project_id,)).fetchone()
+            row = db.execute(
+                "SELECT * FROM projects WHERE id = ?" + (f" AND {frag}" if frag else ""),
+                [project_id] + params).fetchone()
             if not row:
                 return self.send_error_json(404, "unknown project")
             if row["key_id"]:
@@ -1455,18 +1618,23 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- models and prices --
 
-    def api_models(self):
+    def api_models(self, ident):
         """The most-used models seen in the data plus every priced model, so
         admins can see which models still need a price. `omitted` counts seen
-        models beyond MAX_MODEL_ROWS."""
-        stats = """SELECT model, COUNT(*) AS turns, COUNT(DISTINCT session_id) AS sessions,
-                          MAX(ts) AS last_ts
-                   FROM model_turns"""
+        models beyond MAX_MODEL_ROWS. model_turns has no project column, so a
+        scoped caller joins sessions; everyone else keeps the single-table scan."""
+        frag, sp = scope_sql(ident, "s.project")
+        src = "model_turns mt" + (" JOIN sessions s ON s.session_id = mt.session_id" if frag else "")
+        scoped = f" WHERE {frag}" if frag else ""
+        stats = f"""SELECT mt.model AS model, COUNT(*) AS turns,
+                           COUNT(DISTINCT mt.session_id) AS sessions, MAX(mt.ts) AS last_ts
+                    FROM {src}"""
         with self.store.connect() as db:
             top = {r["model"]: dict(r) for r in db.execute(
-                stats + " GROUP BY model ORDER BY turns DESC, model LIMIT ?", (MAX_MODEL_ROWS,))}
+                stats + scoped + " GROUP BY mt.model ORDER BY turns DESC, mt.model LIMIT ?",
+                sp + [MAX_MODEL_ROWS])}
             seen_total = db.execute(
-                "SELECT COUNT(DISTINCT model) AS n FROM model_turns").fetchone()["n"]
+                f"SELECT COUNT(DISTINCT mt.model) AS n FROM {src}{scoped}", sp).fetchone()["n"]
             prices = load_prices(db)
             # A priced model below the top rows still needs its real usage, and
             # must not be counted as omitted while it is listed.
@@ -1475,8 +1643,9 @@ class Handler(BaseHTTPRequestHandler):
             for i in range(0, len(priced_rest), 500):  # stay under SQLite's variable limit
                 chunk = priced_rest[i:i + 500]
                 seen.update({r["model"]: dict(r) for r in db.execute(
-                    stats + f" WHERE model IN ({','.join('?' for _ in chunk)}) GROUP BY model",
-                    chunk)})
+                    stats + f" WHERE mt.model IN ({','.join('?' for _ in chunk)})"
+                    + (f" AND {frag}" if frag else "") + " GROUP BY mt.model",
+                    chunk + sp)})
         listed = []
         for model in set(seen) | set(prices):
             entry = seen.get(model) or {"model": model, "turns": 0, "sessions": 0,
@@ -1537,10 +1706,15 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json({"ok": True})
 
     @staticmethod
-    def _filters(q, alias=""):
-        """Build a WHERE fragment + params from project/from/to query params."""
+    def _filters(q, ident, alias=""):
+        """Build a WHERE fragment + params from project/from/to query params,
+        inside the caller's scope."""
         where, params = [], []
         col = (alias + ".") if alias else ""
+        frag, sp = scope_sql(ident, f"{col}project")
+        if frag:
+            where.append(frag)
+            params += sp
         if q.get("project"):
             where.append(f"{col}project = ?")
             params.append(q["project"])
@@ -1552,8 +1726,8 @@ class Handler(BaseHTTPRequestHandler):
             params.append(q["to"])
         return (" WHERE " + " AND ".join(where)) if where else "", params
 
-    def api_overview(self, q):
-        where, params = self._filters(q)
+    def api_overview(self, q, ident):
+        where, params = self._filters(q, ident)
         with self.store.connect() as db:
             totals = db.execute(
                 f"""SELECT COUNT(DISTINCT session_id) AS sessions,
@@ -1576,6 +1750,10 @@ class Handler(BaseHTTPRequestHandler):
                     GROUP BY tool_name ORDER BY n DESC LIMIT 12""", params).fetchall()
             # Token totals come from transcript snapshots (sessions table).
             swhere, sparams = [], []
+            frag, sp = scope_sql(ident, "project")
+            if frag:
+                swhere.append(frag)
+                sparams += sp
             if q.get("project"):
                 swhere.append("project = ?")
                 sparams.append(q["project"])
@@ -1603,7 +1781,7 @@ class Handler(BaseHTTPRequestHandler):
                            SUM(tool_calls) AS tool_calls, MAX(last_ts) AS last_ts
                     FROM sessions{sw} GROUP BY origin ORDER BY last_ts DESC""",
                 sparams).fetchall()
-            models = self._overview_models(db, q)
+            models = self._overview_models(db, q, ident)
         return {
             "totals": {**dict(totals), **dict(tokens)},
             "per_day": [dict(r) for r in per_day],
@@ -1614,11 +1792,15 @@ class Handler(BaseHTTPRequestHandler):
         }
 
     @staticmethod
-    def _overview_models(db, q):
+    def _overview_models(db, q, ident):
         """Per-model statistics for the window. A turn is in the window by its
         own timestamp, so a session crossing the boundary contributes only
         the turns inside it."""
         where, params = [], []
+        frag, sp = scope_sql(ident, "s.project")
+        if frag:
+            where.append(frag)
+            params += sp
         if q.get("project"):
             where.append("s.project = ?")
             params.append(q["project"])
@@ -1651,8 +1833,12 @@ class Handler(BaseHTTPRequestHandler):
         return {"rows": rows[:MAX_MODEL_ROWS], "models_omitted": max(0, len(rows) - MAX_MODEL_ROWS),
                 "series": series, "per_day": per_day, **totals}
 
-    def api_sessions(self, q):
+    def api_sessions(self, q, ident):
         where, params = [], []
+        frag, sp = scope_sql(ident, "project")
+        if frag:
+            where.append(frag)
+            params += sp
         if q.get("project"):
             where.append("project = ?")
             params.append(q["project"])
@@ -1683,12 +1869,16 @@ class Handler(BaseHTTPRequestHandler):
                 params + [limit, offset]).fetchall()
         return {"total": total, "sessions": [dict(r) for r in rows]}
 
-    def api_session_detail(self, session_id):
+    def api_session_detail(self, session_id, ident):
         if not SESSION_ID_RE.match(session_id):
             return self.send_error_json(400, "bad session id")
+        frag, sp = scope_sql(ident, "project")
         with self.store.connect() as db:
-            sess = db.execute("SELECT * FROM sessions WHERE session_id = ?",
-                              (session_id,)).fetchone()
+            # A session outside the scope is "unknown", never "forbidden": an
+            # id pasted in chat must not confirm it exists here (AC13).
+            sess = db.execute(
+                "SELECT * FROM sessions WHERE session_id = ?" + (f" AND {frag}" if frag else ""),
+                [session_id] + sp).fetchone()
             if not sess:
                 return self.send_error_json(404, "unknown session")
             events = db.execute(
@@ -1711,11 +1901,21 @@ class Handler(BaseHTTPRequestHandler):
         })
 
     def api_get_transcript(self, session_id):
-        if not self.require("member"):
+        ident = self.require("member")
+        if not ident:
             return
         if not SESSION_ID_RE.match(session_id):
             return self.send_error_json(400, "bad session id")
         p = self.store.transcript_path(session_id)
+        if p and ident["scope"] is not None:
+            # Same answer as "no snapshot" for a session outside the scope (AC13).
+            frag, sp = scope_sql(ident, "project")
+            with self.store.connect() as db:
+                visible = db.execute(
+                    f"SELECT 1 FROM sessions WHERE session_id = ? AND {frag}",
+                    [session_id] + sp).fetchone()
+            if not visible:
+                p = None
         if not p:
             return self.send_error_json(404, "no transcript snapshot for this session")
         data = p.read_bytes()
@@ -1728,12 +1928,17 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def api_export(self, q):
-        if not self.require("member"):
+        ident = self.require("member")
+        if not ident:
             return
         fmt = q.get("format") or "jsonl"
         if fmt not in ("jsonl", "csv"):
             return self.send_error_json(400, "format must be jsonl or csv")
         where, params = [], []
+        frag, sp = scope_sql(ident, "project")
+        if frag:
+            where.append(frag)
+            params += sp
         if q.get("project"):
             where.append("project = ?")
             params.append(q["project"])
