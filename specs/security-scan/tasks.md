@@ -267,7 +267,7 @@ inside `_rederive_all` with the existing progress reporting; make
 
 ## Task 13 — `GET /api/v1/security`
 
-**Status:** pending
+**Status:** done
 
 **Files:** `server/gaide_trace_server.py`, `tests/test_security_api.py`
 
@@ -278,11 +278,11 @@ series, coverage, gaps, suppressions; plus `as_of`, staleness and truncation.
 Reuses `_filters` and `scope_sql`.
 
 **Done when:**
-- [ ] The shape matches AC15 and the numbers match a seeded store
-- [ ] A scoped member sees only granted projects, with no project name, rule
+- [x] The shape matches AC15 and the numbers match a seeded store
+- [x] A scoped member sees only granted projects, with no project name, rule
   name, count or session id from outside (AC23)
-- [ ] A non-granted `?project=` answers exactly as a project with no data
-- [ ] Row listings are capped the way the models endpoint is, with the omitted
+- [x] A non-granted `?project=` answers exactly as a project with no data
+- [x] Row listings are capped the way the models endpoint is, with the omitted
   count reported
 
 **Estimate:** ~90 min · **Depends on:** Task 12
@@ -291,7 +291,7 @@ Reuses `_filters` and `scope_sql`.
 
 ## Task 14 — Session detail gains a `security` block
 
-**Status:** pending
+**Status:** done
 
 **Files:** `server/gaide_trace_server.py`, `tests/test_security_api.py`
 
@@ -299,9 +299,9 @@ Reuses `_filters` and `scope_sql`.
 evidence) and actions, additive to the existing response.
 
 **Done when:**
-- [ ] The block is present and correct for a seeded session
-- [ ] Existing session-detail tests pass unchanged (AC16)
-- [ ] A session outside the caller's scope still answers 404
+- [x] The block is present and correct for a seeded session
+- [x] Existing session-detail tests pass unchanged (AC16)
+- [x] A session outside the caller's scope still answers 404
 
 **Estimate:** ~30 min · **Depends on:** Task 13
 
@@ -309,7 +309,7 @@ evidence) and actions, additive to the existing response.
 
 ## Task 15 — `GET /api/v1/security/export`
 
-**Status:** pending
+**Status:** done
 
 **Files:** `server/gaide_trace_server.py`, `tests/test_security_api.py`
 
@@ -317,9 +317,9 @@ evidence) and actions, additive to the existing response.
 caller's scope and the same filters as the page.
 
 **Done when:**
-- [ ] Both kinds in both formats export the rows behind the page
-- [ ] A scoped member's export carries nothing from outside the scope
-- [ ] No exported field contains a matched value (AC21)
+- [x] Both kinds in both formats export the rows behind the page
+- [x] A scoped member's export carries nothing from outside the scope
+- [x] No exported field contains a matched value (AC21)
 
 **Estimate:** ~45 min · **Depends on:** Task 13
 
@@ -327,7 +327,7 @@ caller's scope and the same filters as the page.
 
 ## Task 16 — Custom term endpoints
 
-**Status:** pending
+**Status:** done
 
 **Files:** `server/gaide_trace_server.py`, `tests/test_security_api.py`
 
@@ -336,11 +336,11 @@ case-insensitive, 4–64 characters, ≤100 per project; a change marks the scan
 stale for the affected projects.
 
 **Done when:**
-- [ ] Valid lists are stored and served; invalid ones are rejected with 400 and
+- [x] Valid lists are stored and served; invalid ones are rejected with 400 and
   no change (AC18)
-- [ ] A member token and a `member` key get 403 (AC24)
-- [ ] Terms are matched literally, never compiled (AC25)
-- [ ] New data is scanned against new terms immediately; stored data is
+- [x] A member token and a `member` key get 403 (AC24)
+- [x] Terms are matched literally, never compiled (AC25)
+- [x] New data is scanned against new terms immediately; stored data is
   reported stale
 
 **Estimate:** ~60 min · **Depends on:** Task 13
@@ -349,7 +349,7 @@ stale for the affected projects.
 
 ## Task 17 — Rescan endpoints
 
-**Status:** pending
+**Status:** done
 
 **Files:** `server/gaide_trace_server.py`, `tests/test_security_api.py`
 
@@ -358,10 +358,10 @@ single-flight background thread, committing per session; `GET` reports state,
 start, progress and last result, including a failure (Principle 8).
 
 **Done when:**
-- [ ] A rescan refreshes findings for the chosen project and clears staleness
-- [ ] A second concurrent request answers 409 (AC19)
-- [ ] A member gets 403
-- [ ] A rescan running while events are ingested neither loses data nor errors
+- [x] A rescan refreshes findings for the chosen project and clears staleness
+- [x] A second concurrent request answers 409 (AC19)
+- [x] A member gets 403
+- [x] A rescan running while events are ingested neither loses data nor errors
 
 **Estimate:** ~60 min · **Depends on:** Task 16
 
@@ -468,21 +468,21 @@ passes: `code-reviewer`, the mandatory `security-reviewer`, and an independent
 | AC9 (only invoked commands) | 9 | done (tests green) |
 | AC10 (outcome never guessed) | 9 | done (tests green) |
 | AC11 (suppressions separate) | 10 | done (tests green) |
-| AC12 (coverage) | 11, 13 | pending |
-| AC13 (gap list) | 11, 13 | pending |
+| AC12 (coverage) | 11, 13 | done (tests green) |
+| AC13 (gap list) | 11, 13 | done (tests green) |
 | AC14 (no GAIDE dependency) | 9 | done (tests green) |
-| AC15 (aggregate endpoint) | 13 | pending |
-| AC16 (session block) | 14 | pending |
-| AC17 (export) | 15 | pending |
-| AC18 (term endpoints) | 16 | pending |
-| AC19 (rescan) | 17 | pending |
-| AC20 (scope on every read) | 13, 14, 15 | pending |
-| AC21 (no value stored or served) | 3, 15 | pending |
+| AC15 (aggregate endpoint) | 13 | done (tests green) |
+| AC16 (session block) | 14 | done (tests green) |
+| AC17 (export) | 15 | done (tests green) |
+| AC18 (term endpoints) | 16 | done (tests green) |
+| AC19 (rescan) | 17 | done (tests green) |
+| AC20 (scope on every read) | 13, 14, 15 | done (tests green) |
+| AC21 (no value stored or served) | 3, 15 | done (tests green) |
 | AC22 (salted fingerprints) | 5 | done (tests green) |
-| AC23 (no cross-project oracle) | 13, 15 | pending |
-| AC24 (admin-only endpoints) | 16, 17 | pending |
-| AC25 (terms are literal) | 16 | pending |
-| AC26 (bounded scanning) | 3, 8, 13 | pending |
+| AC23 (no cross-project oracle) | 13, 15 | done (tests green) |
+| AC24 (admin-only endpoints) | 16, 17 | done (tests green) |
+| AC25 (terms are literal) | 16 | done (tests green) |
+| AC26 (bounded scanning) | 3, 8, 13 | done (tests green) |
 | AC27 (ingest survives a scan failure) | 7 | done (tests green) |
 | AC28 (Security page) | 18 | pending |
 | AC29 (session page) | 19 | pending |

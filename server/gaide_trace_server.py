@@ -104,6 +104,11 @@ PRICE_TOKEN_COLUMNS = dict(zip(PRICE_FIELDS, (
     "cache_write_5m_tokens", "cache_write_1h_tokens")))
 MAX_PRICE_PER_MTOK = 10_000
 
+# Rows returned per security table: every real team fits, and a flood of
+# distinct sessions from a hostile client does not reach browsers. The totals
+# above each table still cover everything.
+MAX_SECURITY_ROWS = 500
+
 # Models drawn as their own series in the Overview per-day chart; the rest are
 # folded into one "other" bucket, which also bounds the response size. Four
 # categorical slots are what passed CVD validation on the console's tile.
@@ -160,6 +165,61 @@ def normalize_event(row: dict):
     return row
 
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+# Highest severity first, wherever findings are listed.
+SEVERITY_ORDER_SQL = ("CASE severity WHEN 'high' THEN 0"
+                      " WHEN 'medium' THEN 1 ELSE 2 END")
+
+# One security rescan at a time, in this process (specs/security-scan AC19).
+# Admin-triggered, so a second request is refused rather than queued.
+RESCAN = {"state": "idle"}
+RESCAN_LOCK = threading.Lock()
+
+
+def rescan_state(full: bool):
+    """The rescan's state for an API response. `full` is for admins: a
+    project name is withheld from everyone else, since a scoped member must
+    not learn the name of a project outside their scope (AC23)."""
+    with RESCAN_LOCK:
+        state = dict(RESCAN)
+    if not full:
+        state.pop("project", None)
+        state.pop("actor", None)
+        state.pop("failed", None)
+    return state
+
+
+def start_rescan(store, project, actor):
+    """Start the background rescan, or return None if one is running."""
+    with RESCAN_LOCK:
+        if RESCAN.get("state") == "running":
+            return None
+        RESCAN.clear()
+        RESCAN.update({"state": "running", "project": project, "actor": actor,
+                       "started_at": utcnow(), "finished_at": None,
+                       "done": 0, "total": None, "sessions": None,
+                       "transcripts": None, "failed": [], "error": None})
+
+    def progress(done, total):
+        with RESCAN_LOCK:
+            RESCAN["done"], RESCAN["total"] = done, total
+
+    def run():
+        try:
+            summary = store.rescan_security(project=project, progress=progress)
+            with RESCAN_LOCK:
+                RESCAN.update({"state": "done", "finished_at": utcnow(),
+                               "sessions": summary["sessions"],
+                               "transcripts": summary["transcripts"],
+                               "failed": summary["failed"]})
+        except Exception as exc:
+            # A rescan that dies must say so, not look idle (Principle 8).
+            with RESCAN_LOCK:
+                RESCAN.update({"state": "failed", "finished_at": utcnow(),
+                               "error": repr(exc)})
+            print(f"security rescan failed: {exc!r}", file=sys.stderr, flush=True)
+
+    threading.Thread(target=run, name="security-rescan", daemon=True).start()
+    return rescan_state(full=True)
 
 # ---------------------------------------------------------------- storage
 
@@ -525,6 +585,18 @@ class Store:
                 rows = own.execute(sql, (project or "",)).fetchall()
         return tuple(r["term"] for r in rows)
 
+    def get_meta(self, key):
+        with self.connect() as db:
+            row = db.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else None
+
+    def set_meta(self, key, value):
+        with self.connect() as db:
+            db.execute("""INSERT INTO meta (key, value) VALUES (?,?)
+                          ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+                       (key, value))
+            db.commit()
+
     def session_project(self, session_id):
         with self.connect() as db:
             row = db.execute("SELECT project FROM sessions WHERE session_id = ?",
@@ -661,6 +733,10 @@ class Store:
             if progress and time.monotonic() - last_report >= PROGRESS_EVERY_SECONDS:
                 progress(done, len(session_ids))
                 last_report = time.monotonic()
+        if project is None:
+            # Only a full pass can claim the whole store was scanned; that is
+            # what the console's staleness notice compares terms against.
+            self.set_meta("security_scanned_at", utcnow())
         return {"sessions": len(session_ids), "transcripts": transcripts,
                 "failed": failed}
 
@@ -1548,6 +1624,31 @@ class Handler(BaseHTTPRequestHandler):
         if method == "PUT" and path.startswith("/api/v1/transcripts/"):
             return self.api_put_transcript(path.split("/api/v1/transcripts/", 1)[1], q)
 
+        if m == ("GET", "/api/v1/security"):
+            ident = self.require("member")
+            if ident:
+                self.send_json(self.api_security(q, ident))
+            return
+
+        if m == ("GET", "/api/v1/security/export"):
+            return self.api_security_export(q)
+
+        if m == ("GET", "/api/v1/security/terms"):
+            if self.require("admin"):
+                self.send_json(self.api_terms())
+            return
+
+        if m == ("PUT", "/api/v1/security/terms"):
+            return self.api_set_terms()
+
+        if m == ("POST", "/api/v1/security/rescan"):
+            return self.api_start_rescan()
+
+        if m == ("GET", "/api/v1/security/rescan"):
+            if self.require("admin"):
+                self.send_json(rescan_state(full=True))
+            return
+
         if m == ("GET", "/api/v1/overview"):
             ident = self.require("member")
             if ident:
@@ -2159,6 +2260,324 @@ class Handler(BaseHTTPRequestHandler):
         return {"rows": rows[:MAX_MODEL_ROWS], "models_omitted": max(0, len(rows) - MAX_MODEL_ROWS),
                 "series": series, "per_day": per_day, **totals}
 
+    @staticmethod
+    def _session_filters(q, ident, alias=""):
+        """Window a `sessions`-shaped query: a session is in range when its
+        activity overlaps it, which is how Overview already reads them."""
+        where, params = [], []
+        col = (alias + ".") if alias else ""
+        frag, sp = scope_sql(ident, f"{col}project")
+        if frag:
+            where.append(frag)
+            params += sp
+        if q.get("project"):
+            where.append(f"{col}project = ?")
+            params.append(q["project"])
+        if q.get("from"):
+            where.append(f"{col}last_ts >= ?")
+            params.append(q["from"])
+        if q.get("to"):
+            where.append(f"{col}first_ts < ?")
+            params.append(q["to"])
+        return where, params
+
+    def api_security(self, q, ident):
+        """Both halves of the security analysis for the current filter
+        (specs/security-scan AC15). Scope is applied exactly as on every other
+        read: outside it, data does not exist (ADR 0002)."""
+        where, params = self._filters(q, ident)
+        with self.store.connect() as db:
+            return {
+                "scan": self._security_scan(db, q, ident),
+                "exposure": self._security_exposure(db, where, params),
+                "activity": self._security_activity(db, where, params, q, ident),
+            }
+
+    def _security_scan(self, db, q, ident):
+        swhere, sparams = self._session_filters(q, ident)
+        sw = (" WHERE " + " AND ".join(swhere)) if swhere else ""
+        truncated = db.execute(
+            f"SELECT COUNT(*) AS n FROM sessions{sw}"
+            + (" AND " if sw else " WHERE ") + "security_truncated = 1",
+            sparams).fetchone()["n"]
+        scanned = self.store.get_meta("security_scanned_at")
+        changed = self.store.get_meta("security_terms_changed_at")
+        return {"scanned_at": scanned, "terms_changed_at": changed,
+                # Terms apply to arriving data at once, but stored findings
+                # only change when the stored data is read again.
+                "stale": bool(changed and (not scanned or changed > scanned)),
+                "truncated_sessions": truncated,
+                "rescan": rescan_state(full=ident["role"] == "admin")}
+
+    @staticmethod
+    def _security_exposure(db, where, params):
+        totals = db.execute(
+            f"""SELECT COUNT(*) AS findings, TOTAL(count) AS occurrences,
+                       SUM(severity = 'high') AS high,
+                       SUM(severity = 'medium') AS medium,
+                       SUM(severity = 'low') AS low,
+                       COUNT(DISTINCT session_id) AS sessions,
+                       COUNT(DISTINCT fingerprint) AS distinct_values
+                FROM security_findings{where}""", params).fetchone()
+        totals = {k: int(totals[k] or 0) for k in totals.keys()}
+        rules = [dict(r) for r in db.execute(
+            f"""SELECT category, rule, severity, COUNT(*) AS findings,
+                       TOTAL(count) AS occurrences,
+                       COUNT(DISTINCT session_id) AS sessions,
+                       COUNT(DISTINCT fingerprint) AS distinct_values,
+                       MAX(ts) AS last_ts
+                FROM security_findings{where}
+                GROUP BY category, rule, severity
+                ORDER BY {SEVERITY_ORDER_SQL}, findings DESC, rule""", params)]
+        for row in rules:
+            row["occurrences"] = int(row["occurrences"] or 0)
+        buckets = {}
+        for r in db.execute(
+                f"""SELECT substr(ts, 1, 10) AS day, severity, COUNT(*) AS findings
+                    FROM security_findings{where}
+                    {'AND' if where else 'WHERE'} ts IS NOT NULL
+                    GROUP BY day, severity""", params):
+            day = buckets.setdefault(r["day"], {"day": r["day"], "high": 0,
+                                                "medium": 0, "low": 0})
+            day[r["severity"]] = r["findings"]
+        per_day = [buckets[d] for d in sorted(buckets)]
+        recurring = [dict(r) for r in db.execute(
+            f"""SELECT rule, severity, fingerprint, MIN(evidence) AS evidence,
+                       COUNT(DISTINCT session_id) AS sessions, COUNT(*) AS findings,
+                       MIN(ts) AS first_ts, MAX(ts) AS last_ts
+                FROM security_findings{where}
+                GROUP BY rule, severity, fingerprint
+                HAVING COUNT(DISTINCT session_id) > 1
+                ORDER BY sessions DESC, findings DESC LIMIT ?""",
+            params + [MAX_SECURITY_ROWS])]
+        recurring_total = db.execute(
+            f"""SELECT COUNT(*) AS n FROM (
+                  SELECT 1 FROM security_findings{where}
+                  GROUP BY rule, fingerprint
+                  HAVING COUNT(DISTINCT session_id) > 1)""", params).fetchone()["n"]
+        sessions = [dict(r) for r in db.execute(
+            f"""SELECT session_id, project, origin, COUNT(*) AS findings,
+                       SUM(severity = 'high') AS high,
+                       SUM(severity = 'medium') AS medium,
+                       SUM(severity = 'low') AS low, MAX(ts) AS last_ts
+                FROM security_findings{where}
+                GROUP BY session_id, project, origin
+                ORDER BY high DESC, medium DESC, findings DESC LIMIT ?""",
+            params + [MAX_SECURITY_ROWS])]
+        return {"totals": totals, "rules": rules[:MAX_SECURITY_ROWS],
+                "per_day": per_day, "recurring": recurring, "sessions": sessions,
+                "rows_omitted": {
+                    "rules": max(0, len(rules) - MAX_SECURITY_ROWS),
+                    "recurring": max(0, recurring_total - len(recurring)),
+                    "sessions": max(0, totals["sessions"] - len(sessions))}}
+
+    def _security_activity(self, db, where, params, q, ident):
+        # `suppression` is not an action, by construction: no aggregate here
+        # may count it as security work (AC11).
+        acted = where + (" AND " if where else " WHERE ") + "category != 'suppression'"
+        suppressed = where + (" AND " if where else " WHERE ") + "category = 'suppression'"
+        totals = db.execute(
+            f"""SELECT COUNT(*) AS actions, COUNT(DISTINCT session_id) AS sessions
+                FROM security_actions{acted}""", params).fetchone()
+        totals = {k: int(totals[k] or 0) for k in totals.keys()}
+        totals["suppressions"] = db.execute(
+            f"SELECT COUNT(*) AS n FROM security_actions{suppressed}",
+            params).fetchone()["n"]
+        outcomes = ("SUM(outcome = 'clean') AS clean,"
+                    " SUM(outcome = 'findings') AS findings,"
+                    " SUM(outcome = 'error') AS errors,"
+                    " SUM(outcome = 'unknown') AS unknown")
+        categories = [dict(r) for r in db.execute(
+            f"""SELECT category, COUNT(*) AS runs,
+                       COUNT(DISTINCT session_id) AS sessions, {outcomes},
+                       MAX(ts) AS last_ts
+                FROM security_actions{acted}
+                GROUP BY category ORDER BY runs DESC, category""", params)]
+        tools = [dict(r) for r in db.execute(
+            f"""SELECT category, tool, COUNT(*) AS runs,
+                       COUNT(DISTINCT session_id) AS sessions, {outcomes},
+                       MAX(ts) AS last_ts
+                FROM security_actions{acted}
+                GROUP BY category, tool ORDER BY runs DESC, tool LIMIT ?""",
+            params + [MAX_SECURITY_ROWS])]
+        series = [r["category"] for r in categories[:CHART_SERIES]]
+        buckets = {}
+        for r in db.execute(
+                f"""SELECT substr(ts, 1, 10) AS day, category, COUNT(*) AS runs
+                    FROM security_actions{acted} AND ts IS NOT NULL
+                    GROUP BY day, category""", params):
+            key = (r["day"], r["category"] if r["category"] in series else None)
+            buckets[key] = buckets.get(key, 0) + r["runs"]
+        order = {c: i for i, c in enumerate(series)}
+        per_day = [{"day": day, "category": category, "runs": runs}
+                   for (day, category), runs in
+                   sorted(buckets.items(),
+                          key=lambda kv: (kv[0][0], order.get(kv[0][1], len(series))))]
+        suppressions = [dict(r) for r in db.execute(
+            f"""SELECT session_id, project, origin, ts, tool, detail
+                FROM security_actions{suppressed}
+                ORDER BY ts DESC LIMIT ?""", params + [MAX_SECURITY_ROWS])]
+
+        # Coverage reads sessions, not findings: the point is the sessions that
+        # changed code and show no security activity at all.
+        swhere, sparams = self._session_filters(q, ident, alias="s")
+        swhere.append("s.code_edits > 0")
+        sw = " WHERE " + " AND ".join(swhere)
+        ran = ("SELECT 1 FROM security_actions a WHERE a.session_id = s.session_id"
+               " AND a.category != 'suppression'")
+        coverage = db.execute(
+            f"""SELECT COUNT(*) AS code_sessions,
+                       SUM(EXISTS({ran})) AS with_any,
+                       SUM(EXISTS({ran} AND a.category = 'sast')) AS with_sast,
+                       SUM(EXISTS({ran} AND a.category = 'sca')) AS with_sca,
+                       SUM(EXISTS({ran} AND a.category = 'secrets')) AS with_secrets
+                FROM sessions s{sw}""", sparams).fetchone()
+        coverage = {k: int(coverage[k] or 0) for k in coverage.keys()}
+        gaps = [dict(r) for r in db.execute(
+            f"""SELECT s.session_id, s.project, s.origin, s.code_edits, s.last_ts
+                FROM sessions s{sw} AND NOT EXISTS({ran})
+                ORDER BY s.last_ts DESC LIMIT ?""",
+            sparams + [MAX_SECURITY_ROWS])]
+        return {"totals": totals, "categories": categories,
+                "tools": tools, "per_day": per_day, "series": series,
+                "coverage": coverage, "gaps": gaps, "suppressions": suppressions,
+                "rows_omitted": {
+                    "tools": max(0, len(tools) - MAX_SECURITY_ROWS),
+                    "gaps": max(0, coverage["code_sessions"]
+                                - coverage["with_any"] - len(gaps)),
+                    "suppressions": max(0, totals["suppressions"] - len(suppressions))}}
+
+    SECURITY_EXPORTS = {
+        "findings": ("security_findings",
+                     ["session_id", "project", "origin", "ts", "source", "trace_id",
+                      "location", "category", "rule", "severity", "evidence",
+                      "fingerprint", "count"]),
+        "actions": ("security_actions",
+                    ["session_id", "project", "origin", "ts", "category", "tool",
+                     "outcome", "detail", "trace_id"]),
+    }
+
+    def api_security_export(self, q):
+        """The rows behind the page (AC17). No column here can carry a matched
+        value — `evidence` is masked and `detail` names an invocation."""
+        ident = self.require("member")
+        if not ident:
+            return
+        kind = q.get("kind") or "findings"
+        fmt = q.get("format") or "jsonl"
+        if kind not in self.SECURITY_EXPORTS:
+            return self.send_error_json(400, "kind must be findings or actions")
+        if fmt not in ("jsonl", "csv"):
+            return self.send_error_json(400, "format must be jsonl or csv")
+        table, columns = self.SECURITY_EXPORTS[kind]
+        where, params = self._filters(q, ident)
+        if q.get("session"):
+            where += (" AND " if where else " WHERE ") + "session_id = ?"
+            params = params + [q["session"]]
+        with self.store.connect() as db:
+            rows = db.execute(
+                f"SELECT {','.join(columns)} FROM {table}{where} ORDER BY ts",
+                params).fetchall()
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        if fmt == "jsonl":
+            out = "\n".join(json.dumps(dict(r), ensure_ascii=False) for r in rows)
+            body = (out + "\n").encode("utf-8") if out else b""
+            ctype = "application/x-ndjson; charset=utf-8"
+        else:
+            buf = io.StringIO()
+            writer = csv.DictWriter(buf, fieldnames=columns, extrasaction="ignore")
+            writer.writeheader()
+            for r in rows:
+                writer.writerow(dict(r))
+            body = buf.getvalue().encode("utf-8")
+            ctype = "text/csv; charset=utf-8"
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Disposition",
+                         f'attachment; filename="gaide-trace-security-{kind}-{stamp}.{fmt}"')
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def api_terms(self):
+        with self.store.connect() as db:
+            terms = [dict(r) for r in db.execute(
+                "SELECT id, project, term, created_at, created_by"
+                " FROM security_terms ORDER BY project, term")]
+        return {"terms": terms,
+                "scanned_at": self.store.get_meta("security_scanned_at"),
+                "terms_changed_at": self.store.get_meta("security_terms_changed_at")}
+
+    def api_set_terms(self):
+        """Replace the whole term list. Literal keywords only — a term is
+        never compiled, so it cannot change what the scan costs (AC25)."""
+        ident = self.require("admin")
+        if not ident:
+            return
+        payload = self._json_body()
+        if payload is None:
+            return
+        terms = payload.get("terms")
+        if not isinstance(terms, list):
+            return self.send_error_json(400, "terms must be a list")
+        cleaned, per_project = [], {}
+        for entry in terms:
+            if not isinstance(entry, dict):
+                return self.send_error_json(400, "each term must be an object")
+            project = entry.get("project") or ""
+            term = entry.get("term")
+            if not isinstance(project, str) or (
+                    project and not PROJECT_NAME_RE.match(project)):
+                return self.send_error_json(400, f"bad project name: {project!r}")
+            if not isinstance(term, str):
+                return self.send_error_json(400, "each term needs a term string")
+            term = term.strip()
+            if not (security_scan.TERM_MIN_CHARS <= len(term)
+                    <= security_scan.TERM_MAX_CHARS):
+                return self.send_error_json(
+                    400, f"a term is {security_scan.TERM_MIN_CHARS}-"
+                         f"{security_scan.TERM_MAX_CHARS} characters")
+            key = (project, term.lower())
+            if key in per_project:
+                continue
+            per_project[key] = True
+            cleaned.append((project, term))
+        counts = {}
+        for project, _ in cleaned:
+            counts[project] = counts.get(project, 0) + 1
+            if counts[project] > security_scan.MAX_TERMS_PER_PROJECT:
+                return self.send_error_json(
+                    400, f"at most {security_scan.MAX_TERMS_PER_PROJECT}"
+                         " terms per project")
+        now = utcnow()
+        with self.store.connect() as db:
+            db.execute("DELETE FROM security_terms")
+            db.executemany(
+                """INSERT OR IGNORE INTO security_terms
+                     (project, term, created_at, created_by) VALUES (?,?,?,?)""",
+                [(project, term, now, ident["name"]) for project, term in cleaned])
+            db.commit()
+        self.store.set_meta("security_terms_changed_at", now)
+        print(f"security terms replaced by {ident['name']}: {len(cleaned)} terms",
+              flush=True)
+        return self.send_json(self.api_terms())
+
+    def api_start_rescan(self):
+        ident = self.require("admin")
+        if not ident:
+            return
+        payload = self._json_body()
+        if payload is None:
+            return
+        project = payload.get("project") or None
+        if project is not None and not (
+                isinstance(project, str) and PROJECT_NAME_RE.match(project)):
+            return self.send_error_json(400, "bad project name")
+        state = start_rescan(self.store, project, ident["name"])
+        if state is None:
+            return self.send_error_json(409, "a rescan is already running")
+        return self.send_json(state, 202)
+
     def api_sessions(self, q, ident):
         where, params = [], []
         frag, sp = scope_sql(ident, "project")
@@ -2213,8 +2632,24 @@ class Handler(BaseHTTPRequestHandler):
             models, models_total = price_rows(
                 model_usage_rows(db, " WHERE mt.session_id = ?", [session_id]),
                 load_prices(db))
+            findings = db.execute(
+                f"""SELECT category, rule, severity, source, location, evidence,
+                           fingerprint, count, ts
+                    FROM security_findings WHERE session_id = ?
+                    ORDER BY {SEVERITY_ORDER_SQL}, rule, location""",
+                (session_id,)).fetchall()
+            actions = db.execute(
+                """SELECT category, tool, outcome, detail, ts, trace_id
+                   FROM security_actions WHERE session_id = ?
+                   ORDER BY ts, category, tool""", (session_id,)).fetchall()
         self.send_json({
             "session": dict(sess),
+            "security": {
+                "findings": [dict(r) for r in findings],
+                "actions": [dict(r) for r in actions],
+                "code_edits": sess["code_edits"],
+                "truncated": bool(sess["security_truncated"]),
+            },
             # One hostile transcript can name millions of models; the total
             # still covers them all.
             "models": models[:MAX_MODEL_ROWS],
