@@ -128,9 +128,12 @@ committed before the maintainer's approval (Principle 3).
   repository; the test asserts the assembled value, never a stored one.
 - **Ingest latency.** ~40 compiled patterns over four fields of every record,
   on the request path. | Mitigation: patterns compiled at import, caps per
-  field, and a measured budget in Task 20 (a 200-record batch stays within a
-  stated multiple of today's cost); the fallback is to scan only on
-  derivation.
+  field, and a measured budget in Task 20. *Resolved 2026-10-14:* measured at
+  18.7 ms per maximal record (3.7 s for a 200-record batch against the hook's
+  5 s timeout), which was too slow. A single combined alternation was tried and
+  was worse (35 ms); a literal gate per rule brought it to 1.2 ms for ordinary
+  code and 8.2 ms for the worst realistic mix, so the documented fallback
+  (scanning only on derivation) was not needed.
 - **Rescan contends with live ingest for the single SQLite writer.** |
   Mitigation: the job commits per session rather than in one transaction, the
   existing `timeout=30` covers brief contention, and the job is admin-only and
@@ -142,8 +145,13 @@ committed before the maintainer's approval (Principle 3).
   keeps it idempotent; if cost shows up, the size-based short-circuit the
   client already uses for uploads is the next lever.
 - **False positives make the page untrustworthy.** | Mitigation: severities
-  per rule, the rule table surfaces noise by count, and Task 20 runs the
-  scanner over this repository's own store before the page is called done.
+  per rule, and the rule table surfaces noise by count. *Resolved 2026-10-14:*
+  Task 20 was to run the scanner over this repository's own store first, but no
+  trace store exists on this machine. The maintainer decided not to source real
+  text from elsewhere just to calibrate: the rule table **is** the profile, so
+  the catalogue is tightened from it on the first real store, in its own
+  commit. The risk is therefore accepted and visible rather than measured in
+  advance.
 - **Scope bugs leak across projects.** The same risk class ADR 0002 addressed.
   | Mitigation: every new read goes through the existing `scope_sql` helper and
   gets its own negative test; the mandatory `security-reviewer` pass audits

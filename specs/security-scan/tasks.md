@@ -413,7 +413,8 @@ ranking anywhere.
 
 ## Task 20 — Measure cost and noise on real data
 
-**Status:** in-progress (cost measured 2026-10-14; see PROGRESS.md)
+**Status:** done (2026-10-14) — cost measured; the noise half closed by an
+explicit decision, see "Done when" below
 
 **Files:** `specs/security-scan/plan.md` (results), `PROGRESS.md`
 
@@ -424,8 +425,24 @@ is called done. If the budget is missed, apply the documented fallback (scan
 only on derivation/rescan).
 
 **Done when:**
-- [ ] Both numbers recorded in `PROGRESS.md` with the conclusion
-- [ ] The rule catalogue tightened if a rule is dominated by noise
+- [x] The ingest cost recorded in `PROGRESS.md` with its conclusion: 18.7 ms
+  per maximal record was too slow for a full shipping batch, so every rule got
+  a literal gate (1.2 ms for ordinary code, 8.2 ms for the worst realistic
+  mix), and the scan stayed on the ingest path.
+- [~] **The false-positive profile was not measured, by decision of the
+  maintainer on 2026-10-14.** This machine holds no trace store — the
+  repository has no `.gaide-trace/` and no server `data/` — so the only ways to
+  get real text were to read a store from another project or to pull the
+  production server's data. Neither is worth doing to calibrate a catalogue,
+  because **the feature produces this measurement itself**: the "Exposure by
+  rule" table is exactly a per-rule false-positive profile, per project,
+  continuously. The calibration therefore happens on the first real store, with
+  real eyes on that table, in its own commit.
+- [ ] *(superseded by the decision above)* The rule catalogue tightened if a
+  rule is dominated by noise — to be done from the console's own rule table on
+  first real use. Known suspects to look at first: `email` firing inside a
+  connection string, `private-key-file` on a `.key` path that is configuration
+  rather than access, and the widened `secret-assignment`.
 
 **Estimate:** ~45 min · **Depends on:** Task 12
 
