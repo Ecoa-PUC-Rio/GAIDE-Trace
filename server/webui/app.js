@@ -815,6 +815,11 @@ async function viewSession(sid) {
   $("#dl-events-csv").addEventListener("click", () =>
     download(`/api/v1/export${qs({ session: sid, format: "csv" })}`));
 
+  const sec = data.security;
+  if (sec && (sec.findings.length || sec.actions.length || sec.truncated)) {
+    main.appendChild(sessionSecurityCard(sec));
+  }
+
   if (data.models.length) {
     const usage = document.createElement("div");
     usage.className = "card";
@@ -864,6 +869,39 @@ async function viewSession(sid) {
   main.appendChild(tl);
   tl.querySelectorAll(".tl-tool").forEach((el) =>
     el.addEventListener("click", () => el.classList.toggle("open")));
+}
+
+/* This session's own exposure findings and security activity
+   (specs/security-scan AC29). Evidence is masked server-side; the timeline
+   below still shows what was captured, which is the point of the ledger. */
+function sessionSecurityCard(sec) {
+  const el = document.createElement("div");
+  el.className = "card";
+  const findings = sec.findings.length
+    ? `<div class="table-scroll"><table>
+        <thead><tr><th>Severity</th><th>Rule</th><th>Where</th><th>Evidence</th>
+          <th class="num">Count</th></tr></thead>
+        <tbody>${sec.findings.map((f) => `<tr>
+          <td><span class="badge sev-${esc(f.severity)}">${esc(f.severity)}</span></td>
+          <td>${esc(f.rule)}</td>
+          <td>${esc(f.source === "transcript" ? "transcript " + (f.location || "") : (f.location || "event"))}</td>
+          <td><span class="mono-id">${esc(f.evidence || "")}</span></td>
+          <td class="num">${fmt(f.count)}</td></tr>`).join("")}
+        </tbody></table></div>`
+    : `<p class="hint">No exposure finding in this session.</p>`;
+  const actions = sec.actions.length
+    ? `<div class="table-scroll"><table>
+        <thead><tr><th>Category</th><th>Tool</th><th>Outcome</th><th>Invocation</th></tr></thead>
+        <tbody>${sec.actions.map((a) => `<tr>
+          <td>${esc(a.category)}</td><td>${esc(a.tool)}</td>
+          <td>${esc(a.outcome)}</td><td>${esc(a.detail || "")}</td></tr>`).join("")}
+        </tbody></table></div>`
+    : `<p class="hint">No security action recorded in this session${
+        sec.code_edits ? ` — it changed ${fmt(sec.code_edits)} file(s)` : ""}.</p>`;
+  el.innerHTML = `<div class="card-head"><span class="card-title">Security</span>
+      ${sec.truncated ? '<div class="card-tools"><span class="badge warn">scan caps hit</span></div>' : ""}
+    </div>${findings}${actions}`;
+  return el;
 }
 
 async function viewExport() {
@@ -1724,7 +1762,8 @@ async function viewUsers() {
 // ---------------------------------------------------------------- router / auth
 
 const VIEWS = { overview: viewOverview, sessions: viewSessions, projects: viewProjects,
-                export: viewExport, users: viewUsers, keys: viewKeys, prices: viewPrices };
+                security: viewSecurity, export: viewExport, users: viewUsers,
+                keys: viewKeys, prices: viewPrices };
 
 async function route() {
   if (!state.me) return;
@@ -1735,8 +1774,8 @@ async function route() {
     a.classList.toggle("active", hash.startsWith(a.getAttribute("href")) ||
       (m && a.dataset.view === "sessions")));
   const view = hash.slice(2);
-  const dataView = m || ["overview", "sessions", "projects", "export"].includes(view)
-    || !VIEWS[view];
+  const dataView = m || ["overview", "sessions", "projects", "security", "export"]
+    .includes(view) || !VIEWS[view];
   try {
     if (Array.isArray(state.me.scope) && !state.me.scope.length && dataView) {
       main.innerHTML = `<div class="card"><div class="empty"><span class="glyph">◌</span>

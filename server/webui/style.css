@@ -399,6 +399,16 @@ td .mono-id { font-family: var(--mono); font-size: 13px; color: var(--link); }
 }
 .badge.ok { background: #044317; color: #6fdc8c; }
 .badge.warn { background: #520408; color: #ff8389; }
+/* Severity carries its own word, so the colour is never the only cue. */
+.badge.sev-high { background: #520408; color: #ff8389; }
+.badge.sev-medium { background: #3e2a00; color: #fdbf6f; }
+.badge.sev-low { background: var(--layer-02); color: var(--text-helper); }
+
+/* helper paragraphs and the Security page's standing limits note */
+.hint { color: var(--text-helper); font-size: 13px; line-height: 1.5; }
+.hint .badge { margin-right: 8px; }
+.limits { margin: 0 0 16px 20px; color: var(--text-helper); font-size: 13px; }
+.limits li { margin-bottom: 8px; line-height: 1.5; }
 
 /* model usage */
 .model-cell { display: flex; align-items: center; gap: 8px; }
