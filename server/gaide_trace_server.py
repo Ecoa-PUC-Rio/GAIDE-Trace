@@ -73,7 +73,7 @@ from urllib.parse import parse_qs, urlparse
 sys.path.insert(1, str(Path(__file__).resolve().parent))
 import security_scan
 
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 
 # Bump whenever the rules that derive index data from stored transcripts
 # change: `serve` re-derives existing data on start (see
