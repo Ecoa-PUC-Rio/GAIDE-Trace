@@ -359,6 +359,30 @@ class TestRescanAndUpgrade(StoreCase):
         self.store.rebuild_index()
         self.assertEqual(self.security_state(), expected)
 
+    def test_every_full_pass_records_that_the_store_was_scanned(self):
+        """Otherwise the console reports "never scanned" and keeps the stale
+        badge lit after a pass that just ran (found by the code review)."""
+        self.seed()
+        with self.store.connect() as db:
+            db.execute("DELETE FROM meta WHERE key = 'security_scanned_at'")
+            db.commit()
+        self.store.rebuild_index()
+        self.assertIsNotNone(self.store.get_meta("security_scanned_at"))
+
+        with self.store.connect() as db:
+            db.execute("DELETE FROM meta")
+            db.commit()
+        self.store.rederive_if_stale()
+        self.assertIsNotNone(self.store.get_meta("security_scanned_at"))
+
+    def test_a_project_scoped_rescan_does_not_claim_a_full_scan(self):
+        self.seed()
+        with self.store.connect() as db:
+            db.execute("DELETE FROM meta WHERE key = 'security_scanned_at'")
+            db.commit()
+        self.store.rescan_security(project="app")
+        self.assertIsNone(self.store.get_meta("security_scanned_at"))
+
 
 if __name__ == "__main__":
     unittest.main()

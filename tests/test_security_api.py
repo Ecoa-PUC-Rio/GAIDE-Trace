@@ -193,6 +193,35 @@ class TestScope(SecurityApiTestCase):
         self.assertEqual(body["exposure"]["totals"]["findings"], 0)
         self.assertEqual(body["activity"]["gaps"], [])
 
+    def test_the_rescan_state_tells_a_member_nothing_about_other_projects(self):
+        """AC23 — counts and a raw exception string are about the whole store
+        (found by both reviews)."""
+        live.RESCAN.update({"state": "done", "project": "research", "sessions": 7,
+                            "transcripts": 3, "failed": ["s4"], "actor": "root",
+                            "error": "OperationalError('/data/research.jsonl')"})
+        try:
+            member = self.security("two")["scan"]["rescan"]
+            self.assertEqual(member, {"state": "done"})
+            admin = self.security("admin_user")["scan"]["rescan"]
+            self.assertEqual(admin["sessions"], 7)
+        finally:
+            live.RESCAN.clear()
+            live.RESCAN["state"] = "idle"
+
+    def test_the_store_salt_is_never_served(self):
+        """AC22's second half: a fingerprint is only unguessable while the salt
+        stays inside the store."""
+        salt = self.h.store.security_salt().hex()
+        paths = ["/api/v1/security", "/api/v1/security/export?kind=findings",
+                 "/api/v1/security/export?kind=actions", "/api/v1/security/terms",
+                 "/api/v1/security/rescan", "/api/v1/sessions/s1", "/api/v1/me",
+                 "/api/v1/export?format=jsonl"]
+        for path in paths:
+            with self.subTest(path=path):
+                _, raw = self.h.raw_request("GET", path, self.tokens["admin_user"])
+                self.assertNotIn(salt.encode(), raw)
+                self.assertNotIn(salt[:16].encode(), raw)
+
     def test_keys_with_read_access_see_everything(self):
         self.assertEqual(self.security("member_key")["exposure"]["totals"]["high"], 2)
 
@@ -264,6 +293,19 @@ class TestExport(SecurityApiTestCase):
         self.assertNotIn("research", text)
         self.assertEqual(len(text.splitlines()), 2)
 
+    def test_csv_cells_cannot_be_executed_by_a_spreadsheet(self):
+        """A leading = + - @ makes a spreadsheet treat the cell as a formula.
+        Session ids and project names are already charset-validated at ingest;
+        a custom term is not, and it reaches `evidence`."""
+        self.h.as_role("admin_user", "PUT", "/api/v1/security/terms",
+                       {"terms": [{"project": "app", "term": "=cmd|calc"}]})
+        self.h.post_events([event("s9", "prompt.submit", TS, project="app",
+                                  prompt="the value is =cmd|calc here")])
+        text = self.export("admin_user", "?kind=findings&format=csv")
+        self.assertIn("custom-term", text)
+        self.assertIn("'=cmd", text)
+        self.assertNotIn(",=cmd", text)
+
     def test_bad_arguments_are_rejected(self):
         for query in ("?kind=nonsense", "?kind=findings&format=xml"):
             status, _ = self.h.as_role("admin_user", "GET",
@@ -305,6 +347,13 @@ class TestTerms(SecurityApiTestCase):
         with self.h.store.connect() as db:
             self.assertEqual(
                 db.execute("SELECT COUNT(*) FROM security_terms").fetchone()[0], 0)
+
+    def test_global_terms_count_against_each_project_budget(self):
+        cap = server.security_scan.MAX_TERMS_PER_PROJECT
+        terms = ([{"project": "", "term": f"global-{i:04d}"} for i in range(cap // 2)]
+                 + [{"project": "app", "term": f"app-{i:04d}"} for i in range(cap)])
+        status, _ = self.put("admin_user", terms)
+        self.assertEqual(status, 400)
 
     def test_invalid_terms_are_rejected_without_changing_anything(self):
         self.put("admin_user", [{"project": "app", "term": "keepme-please"}])
@@ -375,11 +424,14 @@ class TestRescan(SecurityApiTestCase):
         # Nothing else lost its analysis.
         self.assertEqual(self.security()["exposure"]["totals"]["high"], 2)
 
-    def test_members_and_read_keys_cannot_start_a_rescan(self):
+    def test_members_and_read_keys_cannot_start_or_read_a_rescan(self):
         for who in ("member_user", "two", "member_key"):
-            with self.subTest(who=who):
-                status, _ = self.h.as_role(who, "POST", "/api/v1/security/rescan", {})
-                self.assertEqual(status, 403)
+            for method in ("POST", "GET"):
+                with self.subTest(who=who, method=method):
+                    status, _ = self.h.as_role(
+                        who, method, "/api/v1/security/rescan",
+                        {} if method == "POST" else None)
+                    self.assertEqual(status, 403)
 
     def test_an_unknown_project_is_rejected(self):
         status, _ = self.h.as_role("admin_user", "POST", "/api/v1/security/rescan",

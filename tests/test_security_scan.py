@@ -71,6 +71,49 @@ class TestRuleCatalogue(unittest.TestCase):
     def test_anthropic_key_is_not_also_reported_as_an_openai_key(self):
         self.assertEqual(found(fake("anthropic_key")), {"anthropic-api-key"})
 
+    def test_secret_assignment_reads_real_key_names(self):
+        """The shapes a session actually writes: UPPER_SNAKE, prefixed,
+        suffixed, exported and JSON-quoted (found by the security review)."""
+        body = fake("secret_body")
+        for text in (f"DB_PASSWORD={body}",
+                     f"AWS_SECRET_ACCESS_KEY={body}",
+                     f"export GITHUB_TOKEN={body}",
+                     f"MY_API_KEY={body}",
+                     f"app_secret={body}",
+                     f'{{"password": "{body}"}}',
+                     f"DATABASE_PASSWORD: {body}",
+                     f"password={body}",
+                     fixtures.assignment()):
+            with self.subTest(text=text[:28]):
+                self.assertIn("secret-assignment", found(text))
+
+    def test_a_path_or_url_under_a_secret_name_is_not_a_secret(self):
+        for text in ("private_key_path = /etc/ssl/server.pem",
+                     "token_url = https://example.com/oauth/token",
+                     "credential_file = ./config/creds.json",
+                     "password_file = ~/secrets/pw.txt"):
+            with self.subTest(text=text):
+                self.assertNotIn("secret-assignment", found(text))
+
+    def test_an_assigned_secret_reveals_none_of_itself(self):
+        body = fake("secret_body")
+        findings, _ = scan.scan_text(f"DB_PASSWORD={body}", SALT)
+        evidence = [f["evidence"] for f in findings
+                    if f["rule"] == "secret-assignment"][0]
+        self.assertNotIn(body[:4], evidence)
+        findings, _ = scan.scan_text(fixtures.conn_string(), SALT)
+        evidence = [f["evidence"] for f in findings
+                    if f["rule"] == "credentials-in-url"][0]
+        self.assertNotIn("sup3", evidence)
+
+    def test_a_keyword_dense_line_stays_bounded(self):
+        """The widened key-name pattern must not blow up on text that is all
+        key-ish names: its segments are bounded and their classes disjoint."""
+        start = time.monotonic()
+        scan.scan_text(("my_secret_access_key_value_" * 1900)[:scan.MAX_SCAN_CHARS],
+                       SALT)
+        self.assertLess(time.monotonic() - start, 0.2)
+
     def test_placeholders_are_not_secrets(self):
         for value in ('api_key = "[REDACTED]"', 'password = "changeme"',
                       'token = "xxxxxxxxxx"', 'secret = "${MY_SECRET}"',
@@ -421,6 +464,31 @@ class TestTranscriptScan(StoreCase):
         self.assertEqual(rows[0]["count"], 5)
         self.assertEqual(rows[0]["location"], "line:1")
 
+    def test_path_rules_only_fire_on_lines_carrying_a_tool_call(self):
+        """A transcript holds every prompt verbatim, so prose naming a path is
+        not access to it (found by the code review)."""
+        prose = {"type": "user", "message": {"role": "user",
+                 "content": "never read the .env file, and ignore ~/.ssh/id_rsa"}}
+        call = {"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "name": "Bash", "input": {"command": "cat .env"}}]}}
+        self.store.store_transcript("s1", self.snapshot(prose), "app", "alice")
+        self.assertEqual(self.findings(source="transcript"), [])
+        self.store.store_transcript("s2", self.snapshot(prose, call), "app", "alice")
+        self.assertEqual([r["rule"] for r in self.findings(session_id="s2")],
+                         ["env-file"])
+        self.assertEqual(self.findings(session_id="s2")[0]["location"], "line:2")
+
+    def test_the_session_budget_is_shared_with_the_event_findings(self):
+        cap = scan.MAX_FINDINGS_PER_SESSION
+        self.store.ingest_events([
+            {"trace_id": f"t{i}", "ts": "2026-10-14T10:00:00Z", "event": "tool.call",
+             "session_id": "s1", "project": "app",
+             "tool_input": json.dumps({"command": f"echo AKIA{i:016d}"})}
+            for i in range(10)], "alice")
+        lines = [f"AKIA{i:016d}" for i in range(cap + 50)]
+        self.store.store_transcript("s1", self.snapshot(*lines), "app", "alice")
+        self.assertEqual(len(self.findings()), cap)
+
     def test_a_session_is_capped_and_the_truncation_is_recorded(self):
         lines = [f"AKIA{i:016d}" for i in range(scan.MAX_FINDINGS_PER_SESSION + 50)]
         self.store.store_transcript("s1", self.snapshot(*lines), "app", "alice")
@@ -514,17 +582,29 @@ class TestScanBudget(unittest.TestCase):
     maximal record must stay far below 25 ms. Before the gates it was ~19 ms,
     which is 3.7 s for one batch; the threshold here fails if that returns."""
 
-    def test_a_maximal_record_of_ordinary_code_scans_fast(self):
-        field = ("def handler(event, context):\n"
-                 "    user = db.get(event['id'])\n"
-                 "    return {'ok': True, 'name': user.name}\n" * 300)[:20_000]
-        row = {f: field for f in scan.EVENT_TEXT_FIELDS}
+    def field(self):
+        return ("def handler(event, context):\n"
+                "    user = db.get(event['id'])\n"
+                "    return {'ok': True, 'name': user.name}\n" * 300)[:20_000]
+
+    def measure(self, row, runs=10):
         start = time.monotonic()
-        for _ in range(10):
+        for _ in range(runs):
             scan.scan_event(row, SALT)
-        per_record = (time.monotonic() - start) / 10
-        self.assertLess(per_record, 0.005,
-                        f"{per_record * 1000:.1f} ms/record is over the budget")
+        return (time.monotonic() - start) / runs
+
+    def test_the_gates_keep_a_maximal_record_far_below_the_ungated_cost(self):
+        """Relative, not wall-clock: a loaded CI box slows both measurements,
+        and what must not come back is the ungated cost (~19 ms/record, 3.7 s
+        for one shipping batch against a 5 s client timeout)."""
+        row = {f: self.field() for f in scan.EVENT_TEXT_FIELDS}
+        gated = self.measure(row)
+        with mock.patch.object(
+                scan, "RULES", tuple(r._replace(gate=()) for r in scan.RULES)):
+            ungated = self.measure(row)
+        self.assertLess(gated * 4, ungated,
+                        f"gated {gated * 1000:.1f} ms vs ungated "
+                        f"{ungated * 1000:.1f} ms — the gates stopped paying")
 
 
 if __name__ == "__main__":

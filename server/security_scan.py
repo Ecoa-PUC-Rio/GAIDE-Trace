@@ -162,6 +162,10 @@ def _real_secret(value: str) -> bool:
         return False
     if value[0] in "$<%{" or "${" in value or "{{" in value:
         return False
+    # A file path or an endpoint under a secret-shaped name (private_key_path,
+    # token_url) is configuration, not the credential itself.
+    if value.startswith(("/", "./", "../", "~/", "http://", "https://")):
+        return False
     # "aaaaaaaa", "00000000": no real key has three distinct characters.
     return len(set(value)) >= 4
 
@@ -216,11 +220,19 @@ RULES = (
     _rule("vault-token", SECRET, HIGH,
           r"\bhv[sb]\.[A-Za-z0-9_-]{20,}",
           gate=("hvs.", "hvb.")),
+    # The key name may be prefixed, suffixed and quoted: DB_PASSWORD=,
+    # AWS_SECRET_ACCESS_KEY=, MY_API_KEY=, {"password": "..."}. The segment
+    # quantifiers are bounded and their character classes are disjoint from the
+    # separators around them, so there is no backtracking blow-up. Nothing of
+    # the value is revealed: unlike a vendor-prefixed key, its first characters
+    # are the secret's own entropy.
     _rule("secret-assignment", SECRET, HIGH,
-          r"(?i)\b(?:api[_-]?key|secret|token|password|passwd|pwd|credential|"
-          r"private[_-]?key|access[_-]?key)\b\s*[:=]\s*[\"']?"
+          r"(?i)(?<![A-Za-z0-9])(?:[A-Za-z0-9]{1,30}[_-])?"
+          r"(?:api[_-]?key|secret|token|password|passwd|pwd|credential|"
+          r"private[_-]?key|access[_-]?key)"
+          r"(?:[_-][A-Za-z0-9]{1,30}){0,3}[\"']?\s*[:=]\s*[\"']?"
           r"(?P<v>[^\s\"',;]{8,128})",
-          validate=_real_secret,
+          validate=_real_secret, reveal=0,
           gate=("key", "secret", "token", "password",
                 "passwd", "pwd", "credential")),
     _rule("jwt", SECRET, MEDIUM,
@@ -228,7 +240,7 @@ RULES = (
           gate=("eyj",)),
     _rule("credentials-in-url", SECRET, MEDIUM,
           r"\b[a-z][a-z0-9+.-]{1,20}://[^\s:/@]{1,64}:(?P<v>[^\s:/@]{1,128})@",
-          gate=("://",)),
+          reveal=0, gate=("://",)),
 
     # -- sensitive paths (scanned only where a tool addressed a file) ----
     _rule("env-file", PATH, HIGH, r"\.env(?:\.[A-Za-z0-9_-]{1,20})?\b",
@@ -293,6 +305,13 @@ EVENT_TEXT_FIELDS = ("prompt", "tool_input", "tool_response",
                      "last_assistant_message")
 PATH_SCANNED_FIELDS = frozenset({"tool_input"})
 
+# A transcript line carries a tool call (or its result) when it contains one of
+# these content-block types. Path rules apply only there, for the same reason
+# they apply only to an event's tool_input: a prompt that names ~/.ssh is not
+# access to it, and transcripts contain every prompt verbatim.
+TOOL_LINE_MARKERS = ("tool_use", "tool_result", "toolUse", "toolResult",
+                     "function_call", "tool_calls")
+
 
 # ---------------------------------------------------------------- primitives
 
@@ -328,13 +347,13 @@ def _passes_gate(gate, text, lowered, hits):
     return hit
 
 
-def _finding(rule, value, salt):
+def _finding(rule, value, digest):
     return {
         "category": rule.category,
         "rule": rule.name,
         "severity": rule.severity,
         "evidence": mask(value, rule.reveal),
-        "fingerprint": fingerprint(value, salt),
+        "fingerprint": digest,
         "count": 1,
     }
 
@@ -363,7 +382,8 @@ def scan_text(text, salt, terms=(), skip_categories=()):
             value = match.groupdict().get("v") or match.group(0)
             if rule.validate and not rule.validate(value):
                 continue
-            key = (rule.name, fingerprint(value, salt))
+            digest = fingerprint(value, salt)
+            key = (rule.name, digest)
             existing = agg.get(key)
             if existing:
                 existing["count"] += 1
@@ -371,7 +391,7 @@ def scan_text(text, salt, terms=(), skip_categories=()):
             if len(agg) >= MAX_FINDINGS_PER_RECORD:
                 capped = truncated = True
                 break
-            agg[key] = _finding(rule, value, salt)
+            agg[key] = _finding(rule, value, digest)
         if capped:
             break
     if terms and not capped:
@@ -426,12 +446,17 @@ class TranscriptScan:
         self.terms = tuple(terms)
         self.truncated = False
         self._agg = {}
+        self._full = False
 
     def line(self, number, raw):
         """Scan one line. `number` is its 1-based position in the file."""
+        if self._full:
+            return  # the session cap is reached; the rest of the file is free
         if isinstance(raw, (bytes, bytearray)):
             raw = raw.decode("utf-8", "replace")
-        findings, truncated = scan_text(raw, self.salt, self.terms)
+        skip = () if any(m in raw for m in TOOL_LINE_MARKERS) else (PATH,)
+        findings, truncated = scan_text(raw, self.salt, self.terms,
+                                        skip_categories=skip)
         self.truncated = self.truncated or truncated
         for finding in findings:
             key = (finding["rule"], finding["fingerprint"])
@@ -440,7 +465,7 @@ class TranscriptScan:
                 existing["count"] += finding["count"]
                 continue
             if len(self._agg) >= MAX_FINDINGS_PER_SESSION:
-                self.truncated = True
+                self.truncated = self._full = True
                 continue
             finding["location"] = f"line:{number}"
             self._agg[key] = finding
@@ -473,6 +498,11 @@ ACTION_CATEGORIES = (SAST, SCA, SECRETS, IAC, CONTAINER, DAST, SUPPLY_CHAIN,
                      REVIEW)
 
 MAX_COMMAND_CHARS = 4_000
+# Sentinel for "the caller has not parsed the payload yet".
+_UNPARSED = object()
+# Written content is matched for suppression markers, which can sit anywhere in
+# a file, so it gets the scanner's own budget rather than the command one.
+MAX_CONTENT_CHARS = MAX_SCAN_CHARS
 
 # (category, tool, program, subcommands) — an entry with subcommands matches
 # only those; one with () matches any invocation of the program and is the
@@ -592,9 +622,11 @@ _WRAPPERS = frozenset({
 })
 _WRAPPER_SUBCOMMANDS = frozenset({"run", "exec", "tool"})
 
+# Anchored to the end of a line: a finding whose *text* contains "permission
+# denied" is not a failed run (AC10 — reported only when it is unambiguous).
 _OUTCOME_ERROR_RE = re.compile(
-    r"(?i)(command not found|no such file or directory|permission denied|"
-    r"traceback \(most recent call last\))")
+    r"(?im)^[^\n]{0,80}?(?:command not found|no such file or directory|"
+    r"permission denied)\s*$|^traceback \(most recent call last\)")
 _OUTCOME_CLEAN_RE = re.compile(
     r"(?i)\b(?:no (?:findings|issues|vulnerabilities|secrets|leaks|problems)|"
     r"0 (?:findings|issues|vulnerabilities|secrets|leaks)|found 0 \w+|"
@@ -604,11 +636,18 @@ _OUTCOME_FINDINGS_RE = re.compile(
     r"secrets?|leaks?|errors?)\b")
 
 
-def _tool_payload(row):
-    """The tool call's input as a mapping, or None when it carries none."""
+def tool_payload(row):
+    """The tool call's input as a mapping, or None when it carries none.
+
+    Bounded before parsing: `tool_input` is written by whoever holds an agent
+    key, and a 44 MB value cost ~300 ms and ~114 MB per call before this cap.
+    A truncated JSON value simply fails to parse and is treated as command
+    text, which is what the catalogue reads anyway."""
     raw = row.get("tool_input")
     if not isinstance(raw, str) or not raw:
         return None
+    if len(raw) > MAX_SCAN_CHARS:
+        raw = raw[:MAX_SCAN_CHARS]
     try:
         payload = json.loads(raw)
     except (ValueError, RecursionError):
@@ -620,7 +659,7 @@ def _tool_payload(row):
     return {}
 
 
-def _payload_text(payload, keys):
+def _payload_text(payload, keys, limit=MAX_COMMAND_CHARS):
     parts = []
     for key in keys:
         value = payload.get(key)
@@ -631,7 +670,7 @@ def _payload_text(payload, keys):
                          or json.dumps(value, default=str))
         elif isinstance(value, dict):
             parts.append(json.dumps(value, default=str))
-    return "\n".join(parts)[:MAX_COMMAND_CHARS]
+    return "\n".join(parts)[:limit]
 
 
 def _program_tokens(segment):
@@ -688,18 +727,20 @@ def _outcome(row):
     return "unknown"
 
 
-def classify_tool_call(row):
+def classify_tool_call(row, payload=_UNPARSED):
     """Security activity evidenced by one tool call.
 
     Returns a list of `{category, tool, outcome, detail}`. `detail` names the
-    invocation only — never the command, which can carry a secret."""
+    invocation only — never the command, which can carry a secret. Callers that
+    also ask `is_code_edit` pass the payload so the record is parsed once."""
     if row.get("event") not in ("tool.call", "tool.fail"):
         return []
-    payload = _tool_payload(row)
+    if payload is _UNPARSED:
+        payload = tool_payload(row)
     if payload is None:
         return []
     command = _payload_text(payload, COMMAND_KEYS)
-    written = _payload_text(payload, CONTENT_KEYS)
+    written = _payload_text(payload, CONTENT_KEYS, MAX_CONTENT_CHARS)
     paths = _payload_text(payload, PATH_KEYS)
     outcome = _outcome(row)
     out, seen = [], set()
@@ -741,7 +782,7 @@ def classify_tool_call(row):
     return out
 
 
-def is_code_edit(row):
+def is_code_edit(row, payload=_UNPARSED):
     """Whether this call wrote code — what makes a session code-touching, and
     therefore expected to carry some security activity (AC12)."""
     if row.get("event") not in ("tool.call", "tool.fail"):
@@ -749,7 +790,8 @@ def is_code_edit(row):
     name = re.sub(r"[^a-z0-9]", "", (row.get("tool_name") or "").lower())
     if name in CODE_EDIT_TOOLS:
         return True
-    payload = _tool_payload(row)
+    if payload is _UNPARSED:
+        payload = tool_payload(row)
     if not payload:
         return False
     return bool(CODE_COMMAND_RE.search(_payload_text(payload, COMMAND_KEYS)))

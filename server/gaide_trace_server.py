@@ -70,7 +70,7 @@ from urllib.parse import parse_qs, urlparse
 
 # The server is a script, not a package: deployments and the test loader open
 # it by path, which does not put its own directory on sys.path (ADR 0003).
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(1, str(Path(__file__).resolve().parent))
 import security_scan
 
 VERSION = "0.6.0"
@@ -182,9 +182,10 @@ def rescan_state(full: bool):
     with RESCAN_LOCK:
         state = dict(RESCAN)
     if not full:
-        state.pop("project", None)
-        state.pop("actor", None)
-        state.pop("failed", None)
+        # Everything else is about the whole store — counts of sessions the
+        # caller may not see, and `error` is an uncontrolled repr that can
+        # carry a path or an id from another project (AC23).
+        return {"state": state.get("state", "idle")}
     return state
 
 
@@ -502,9 +503,12 @@ class Store:
             touched = set()
             scan_state = {"terms": {}, "counts": {}}
             for row in accepted:
-                self._bump_session(db, row)
+                # Parsed once and shared: both the code-edit counter and the
+                # activity classifier read the same tool input.
+                payload = security_scan.tool_payload(row)
+                self._bump_session(db, row, payload)
                 self._scan_event(db, row, salt, scan_state)
-                self._record_actions(db, row)
+                self._record_actions(db, row, payload)
                 if self._add_event_turn(db, row):
                     touched.add(row["session_id"])
             for sid in touched:
@@ -526,7 +530,7 @@ class Store:
         return inserted, duplicates
 
     @staticmethod
-    def _bump_session(db, row):
+    def _bump_session(db, row, payload=security_scan._UNPARSED):
         ev = row["event"]
         db.execute(
             """INSERT INTO sessions (session_id, project, origin, first_ts, last_ts, events)
@@ -552,7 +556,7 @@ class Store:
                        (row["session_id"],))
         # A failed write changed nothing, so only successful calls count: this
         # is the denominator of the coverage figure (AC12).
-        if ev == "tool.call" and security_scan.is_code_edit(row):
+        if ev == "tool.call" and security_scan.is_code_edit(row, payload):
             db.execute("UPDATE sessions SET code_edits = code_edits + 1"
                        " WHERE session_id = ?", (row["session_id"],))
 
@@ -620,13 +624,27 @@ class Store:
         db.execute("UPDATE sessions SET security_truncated = 1"
                    " WHERE session_id = ?", (session_id,))
 
+    @staticmethod
+    def _row_project(db, row, state):
+        """The project a finding belongs to: the session's, which _bump_session
+        has already resolved, falling back to the record's own field."""
+        sid = row["session_id"]
+        cached = state.setdefault("projects", {}).get(sid)
+        if cached:
+            return cached
+        found = db.execute("SELECT project FROM sessions WHERE session_id = ?",
+                           (sid,)).fetchone()
+        project = (found["project"] if found else None) or row.get("project")
+        state["projects"][sid] = project
+        return project
+
     def _scan_event(self, db, row, salt, state):
         """Exposure findings for one ingested record. A scanner failure costs
         findings, never the record: it is logged and ingest continues (AC27,
         Principle 8). `state` caches per-project terms and per-session counts
         for the batch."""
         try:
-            project = row.get("project")
+            project = self._row_project(db, row, state)
             cached = state["terms"].get(project or "")
             if cached is None:
                 cached = state["terms"][project or ""] = self.security_terms(
@@ -654,20 +672,23 @@ class Store:
             print(f"security scan: event {row.get('trace_id')!r}: {exc!r}",
                   file=sys.stderr, flush=True)
 
-    def _record_actions(self, db, row):
+    def _record_actions(self, db, row, payload=security_scan._UNPARSED):
         """Security activity evidenced by one record. Same contract as the
         exposure scan: a classifier failure is logged and costs the action,
         never the record (Principle 8)."""
         try:
-            actions = security_scan.classify_tool_call(row)
+            actions = security_scan.classify_tool_call(row, payload)
             if not actions:
                 return
+            project = db.execute("SELECT project FROM sessions WHERE session_id = ?",
+                                 (row["session_id"],)).fetchone()
+            project = (project["project"] if project else None) or row.get("project")
             db.executemany(
                 """INSERT OR IGNORE INTO security_actions
                      (trace_id, session_id, project, origin, ts, category, tool,
                       outcome, detail)
                    VALUES (?,?,?,?,?,?,?,?,?)""",
-                [(row.get("trace_id") or "", row["session_id"], row.get("project"),
+                [(row.get("trace_id") or "", row["session_id"], project,
                   row.get("origin"), row.get("ts"), a["category"], a["tool"],
                   a["outcome"], a["detail"]) for a in actions])
         except Exception as exc:
@@ -709,10 +730,11 @@ class Store:
                         f"SELECT {','.join(EVENT_COLUMNS)} FROM events"
                         " WHERE session_id = ? ORDER BY ts", (sid,)).fetchall()
                     for row in (dict(r) for r in rows):
+                        payload = security_scan.tool_payload(row)
                         self._scan_event(db, row, salt, state)
-                        self._record_actions(db, row)
+                        self._record_actions(db, row, payload)
                         if (row.get("event") == "tool.call"
-                                and security_scan.is_code_edit(row)):
+                                and security_scan.is_code_edit(row, payload)):
                             edits += 1
                     db.execute("UPDATE sessions SET code_edits = ?"
                                " WHERE session_id = ?", (edits, sid))
@@ -733,9 +755,10 @@ class Store:
             if progress and time.monotonic() - last_report >= PROGRESS_EVERY_SECONDS:
                 progress(done, len(session_ids))
                 last_report = time.monotonic()
-        if project is None:
-            # Only a full pass can claim the whole store was scanned; that is
-            # what the console's staleness notice compares terms against.
+        if project is None and with_transcripts:
+            # Only a complete pass can claim the whole store was scanned, and
+            # only once it is done: that is what the console's staleness notice
+            # compares the term list against.
             self.set_meta("security_scanned_at", utcnow())
         return {"sessions": len(session_ids), "transcripts": transcripts,
                 "failed": failed}
@@ -748,13 +771,19 @@ class Store:
         row = db.execute(
             "SELECT project, origin, first_ts FROM sessions WHERE session_id = ?",
             (session_id,)).fetchone()
+        # One budget per session, shared with the event findings that stay:
+        # two independent caps would let a session hold twice the stated limit.
+        kept = db.execute("SELECT COUNT(*) AS n FROM security_findings"
+                          " WHERE session_id = ?", (session_id,)).fetchone()["n"]
+        room = max(security_scan.MAX_FINDINGS_PER_SESSION - kept, 0)
+        findings = collector.findings()
         self._write_findings(
-            db, collector.findings(), session_id=session_id,
+            db, findings[:room], session_id=session_id,
             project=row["project"] if row else None,
             origin=row["origin"] if row else None,
             ts=(row["first_ts"] if row else None) or fallback_ts,
             source="transcript", trace_id="")
-        if collector.truncated:
+        if collector.truncated or len(findings) > room:
             self._mark_truncated(db, session_id)
 
     # ---- model usage ----
@@ -917,13 +946,15 @@ class Store:
                         [row[c] for c in EVENT_COLUMNS],
                     )
                     if cur.rowcount:
-                        self._bump_session(db, row)
+                        payload = security_scan.tool_payload(row)
+                        self._bump_session(db, row, payload)
                         self._scan_event(db, row, salt, scan_state)
-                        self._record_actions(db, row)
+                        self._record_actions(db, row, payload)
                         n += 1
             db.commit()
         self._rederive_all()
         self._set_derived_version(DERIVED_VERSION)
+        self.set_meta("security_scanned_at", utcnow())
         return n
 
     # ---- derived-data versioning ----
@@ -1021,6 +1052,7 @@ class Store:
         # session re-derives on its next transcript upload or rebuild-index
         # (events-only sessions have no upload, so only the latter).
         self._set_derived_version(DERIVED_VERSION)
+        self.set_meta("security_scanned_at", utcnow())
         return {"from": found, "to": DERIVED_VERSION, "transcripts": transcripts,
                 "failed": failed + [s for s in security["failed"] if s not in failed],
                 "sessions_scanned": security["sessions"],
@@ -1184,6 +1216,15 @@ def sum_tokens(column: str) -> str:
     would take down every aggregate view. TOTAL() is floating point and
     never overflows; callers turn the result back into an int."""
     return f"CASE WHEN COUNT({column}) = 0 THEN NULL ELSE TOTAL({column}) END"
+
+
+def csv_cell(value):
+    """A cell a spreadsheet will not execute. Evidence and ids come from
+    ingested data, and a leading =, +, - or @ makes Excel/Sheets treat the
+    cell as a formula."""
+    if isinstance(value, str) and value[:1] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + value
+    return value
 
 
 def int_or_none(value):
@@ -2488,7 +2529,7 @@ class Handler(BaseHTTPRequestHandler):
             writer = csv.DictWriter(buf, fieldnames=columns, extrasaction="ignore")
             writer.writeheader()
             for r in rows:
-                writer.writerow(dict(r))
+                writer.writerow({k: csv_cell(v) for k, v in dict(r).items()})
             body = buf.getvalue().encode("utf-8")
             ctype = "text/csv; charset=utf-8"
         self.send_response(200)
@@ -2545,10 +2586,15 @@ class Handler(BaseHTTPRequestHandler):
         counts = {}
         for project, _ in cleaned:
             counts[project] = counts.get(project, 0) + 1
-            if counts[project] > security_scan.MAX_TERMS_PER_PROJECT:
+        # A global term applies to every project, so it spends that project's
+        # budget too — otherwise the stated limit is twice what it says.
+        globals_ = counts.get("", 0)
+        for project, count in counts.items():
+            effective = count if project == "" else count + globals_
+            if effective > security_scan.MAX_TERMS_PER_PROJECT:
                 return self.send_error_json(
-                    400, f"at most {security_scan.MAX_TERMS_PER_PROJECT}"
-                         " terms per project")
+                    400, f"at most {security_scan.MAX_TERMS_PER_PROJECT} terms per"
+                         " project, counting the ones that apply to all projects")
         now = utcnow()
         with self.store.connect() as db:
             db.execute("DELETE FROM security_terms")
@@ -2736,7 +2782,7 @@ class Handler(BaseHTTPRequestHandler):
             writer = csv.DictWriter(buf, fieldnames=EVENT_COLUMNS, extrasaction="ignore")
             writer.writeheader()
             for r in rows:
-                writer.writerow(dict(r))
+                writer.writerow({k: csv_cell(v) for k, v in dict(r).items()})
             body = buf.getvalue().encode("utf-8")
             ctype = "text/csv; charset=utf-8"
             fname = f"gaide-trace-events-{stamp}.csv"
