@@ -68,6 +68,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+# The server is a script, not a package: deployments and the test loader open
+# it by path, which does not put its own directory on sys.path (ADR 0003).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import security_scan
+
 VERSION = "0.6.0"
 
 # Bump whenever the rules that derive index data from stored transcripts
@@ -169,6 +174,7 @@ class Store:
             d.mkdir(parents=True, exist_ok=True)
         self.db_path = data_dir / "trace.db"
         self._archive_lock = threading.Lock()
+        self._security_salt = None
         with self.connect() as db:
             self._init_schema(db)
 
@@ -272,7 +278,9 @@ class Store:
           transcript_lines INTEGER,
           transcript_updated_at TEXT,
           dominant_model TEXT,
-          model_count INTEGER NOT NULL DEFAULT 0
+          model_count INTEGER NOT NULL DEFAULT 0,
+          code_edits INTEGER NOT NULL DEFAULT 0,
+          security_truncated INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_sessions_last ON sessions(last_ts);
         CREATE TABLE IF NOT EXISTS model_turns (
@@ -305,6 +313,67 @@ class Store:
           updated_at TEXT NOT NULL,
           updated_by TEXT
         );
+        -- Derived security analysis (specs/security-scan, ADR 0003). Like
+        -- model_turns, these are an index: rebuildable from the JSONL archive
+        -- and the transcript snapshots, never the record itself. A finding
+        -- stores a masked pointer plus a salted fingerprint — never the
+        -- matched value.
+        CREATE TABLE IF NOT EXISTS security_findings (
+          id INTEGER PRIMARY KEY,
+          session_id TEXT NOT NULL,
+          project TEXT,
+          origin TEXT,
+          ts TEXT,
+          source TEXT NOT NULL CHECK (source IN ('event','transcript')),
+          -- '' for transcript findings: SQLite treats NULLs as distinct, which
+          -- would defeat the uniqueness that makes re-ingest idempotent.
+          trace_id TEXT NOT NULL DEFAULT '',
+          location TEXT,
+          category TEXT NOT NULL,
+          rule TEXT NOT NULL,
+          severity TEXT NOT NULL CHECK (severity IN ('high','medium','low')),
+          evidence TEXT,
+          fingerprint TEXT NOT NULL,
+          count INTEGER NOT NULL DEFAULT 1,
+          UNIQUE (session_id, source, trace_id, location, rule, fingerprint)
+        );
+        CREATE INDEX IF NOT EXISTS idx_sec_findings_session
+          ON security_findings(session_id);
+        CREATE INDEX IF NOT EXISTS idx_sec_findings_project
+          ON security_findings(project, ts);
+        CREATE INDEX IF NOT EXISTS idx_sec_findings_rule
+          ON security_findings(rule, severity);
+        CREATE INDEX IF NOT EXISTS idx_sec_findings_fingerprint
+          ON security_findings(fingerprint);
+        CREATE TABLE IF NOT EXISTS security_actions (
+          id INTEGER PRIMARY KEY,
+          trace_id TEXT NOT NULL,
+          session_id TEXT NOT NULL,
+          project TEXT,
+          origin TEXT,
+          ts TEXT,
+          category TEXT NOT NULL,
+          tool TEXT NOT NULL,
+          outcome TEXT NOT NULL,
+          detail TEXT,
+          UNIQUE (trace_id, category, tool)
+        );
+        CREATE INDEX IF NOT EXISTS idx_sec_actions_session
+          ON security_actions(session_id);
+        CREATE INDEX IF NOT EXISTS idx_sec_actions_project
+          ON security_actions(project, ts);
+        CREATE INDEX IF NOT EXISTS idx_sec_actions_category
+          ON security_actions(category, ts);
+        -- Vocabulary, not patterns (ADR 0003). An empty project means every
+        -- project; grants are by name, as everywhere else in this schema.
+        CREATE TABLE IF NOT EXISTS security_terms (
+          id INTEGER PRIMARY KEY,
+          project TEXT NOT NULL DEFAULT '',
+          term TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          created_by TEXT,
+          UNIQUE (project, term)
+        );
         CREATE TABLE IF NOT EXISTS meta (
           key TEXT PRIMARY KEY,
           value TEXT
@@ -320,6 +389,14 @@ class Store:
             db.execute("ALTER TABLE sessions ADD COLUMN dominant_model TEXT")
         if "model_count" not in cols:
             db.execute("ALTER TABLE sessions ADD COLUMN model_count INTEGER NOT NULL DEFAULT 0")
+        # v0.6 -> v0.7: security analysis (specs/security-scan). Both default to
+        # 0 and are filled by the scan, which re-derives on the first start of
+        # the new version — no manual command.
+        if "code_edits" not in cols:
+            db.execute("ALTER TABLE sessions ADD COLUMN code_edits INTEGER NOT NULL DEFAULT 0")
+        if "security_truncated" not in cols:
+            db.execute("ALTER TABLE sessions"
+                       " ADD COLUMN security_truncated INTEGER NOT NULL DEFAULT 0")
         # v0.5 -> v0.6: accounts that predate project scopes keep seeing
         # everything; narrowing is an explicit admin action (AC6). Guarded by
         # the column so a later narrowing is never undone by a restart.
@@ -336,6 +413,9 @@ class Store:
         now = utcnow()
         inserted, duplicates = 0, 0
         accepted = []
+        # Resolved before the write transaction opens: it reads `meta` on its
+        # own connection, and SQLite allows one writer at a time.
+        salt = self.security_salt()
         with self.connect() as db:
             for rec in records:
                 if not isinstance(rec, dict):
@@ -359,8 +439,10 @@ class Store:
                 else:
                     duplicates += 1
             touched = set()
+            scan_state = {"terms": {}, "counts": {}}
             for row in accepted:
                 self._bump_session(db, row)
+                self._scan_event(db, row, salt, scan_state)
                 if self._add_event_turn(db, row):
                     touched.add(row["session_id"])
             for sid in touched:
@@ -406,6 +488,109 @@ class Store:
         elif ev == "tool.fail":
             db.execute("UPDATE sessions SET failures = failures + 1 WHERE session_id = ?",
                        (row["session_id"],))
+
+    # ---- security analysis (specs/security-scan) ----
+
+    def security_salt(self) -> bytes:
+        """Per-store HMAC salt for finding fingerprints (ADR 0003). Generated
+        once, never served by any endpoint: without it, a fingerprint over a
+        small value space (a CPF has ~10^11) is reversible by brute force."""
+        if self._security_salt is None:
+            with self.connect() as db:
+                db.execute(
+                    "INSERT OR IGNORE INTO meta (key, value)"
+                    " VALUES ('security_salt', ?)", (secrets.token_hex(32),))
+                db.commit()
+                row = db.execute(
+                    "SELECT value FROM meta WHERE key = 'security_salt'").fetchone()
+            self._security_salt = bytes.fromhex(row["value"])
+        return self._security_salt
+
+    def security_terms(self, project, db=None):
+        """Custom terms that apply to `project`: its own plus the global ones
+        (stored with an empty project name)."""
+        sql = ("SELECT term FROM security_terms WHERE project = '' OR project = ?"
+               " ORDER BY term")
+        if db is not None:
+            rows = db.execute(sql, (project or "",)).fetchall()
+        else:
+            with self.connect() as own:
+                rows = own.execute(sql, (project or "",)).fetchall()
+        return tuple(r["term"] for r in rows)
+
+    def session_project(self, session_id):
+        with self.connect() as db:
+            row = db.execute("SELECT project FROM sessions WHERE session_id = ?",
+                             (session_id,)).fetchone()
+        return row["project"] if row else None
+
+    @staticmethod
+    def _write_findings(db, findings, session_id, project, origin, ts, source,
+                        trace_id):
+        db.executemany(
+            """INSERT OR IGNORE INTO security_findings
+                 (session_id, project, origin, ts, source, trace_id, location,
+                  category, rule, severity, evidence, fingerprint, count)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            [(session_id, project, origin, ts, source, trace_id,
+              f.get("location"), f["category"], f["rule"], f["severity"],
+              f["evidence"], f["fingerprint"], f["count"]) for f in findings])
+
+    @staticmethod
+    def _mark_truncated(db, session_id):
+        db.execute("UPDATE sessions SET security_truncated = 1"
+                   " WHERE session_id = ?", (session_id,))
+
+    def _scan_event(self, db, row, salt, state):
+        """Exposure findings for one ingested record. A scanner failure costs
+        findings, never the record: it is logged and ingest continues (AC27,
+        Principle 8). `state` caches per-project terms and per-session counts
+        for the batch."""
+        try:
+            project = row.get("project")
+            cached = state["terms"].get(project or "")
+            if cached is None:
+                cached = state["terms"][project or ""] = self.security_terms(
+                    project, db=db)
+            findings, truncated = security_scan.scan_event(row, salt, cached)
+            if not findings and not truncated:
+                return
+            sid = row["session_id"]
+            counts = state["counts"]
+            if sid not in counts:
+                counts[sid] = db.execute(
+                    "SELECT COUNT(*) FROM security_findings WHERE session_id = ?",
+                    (sid,)).fetchone()[0]
+            room = max(security_scan.MAX_FINDINGS_PER_SESSION - counts[sid], 0)
+            if len(findings) > room:
+                findings, truncated = findings[:room], True
+            self._write_findings(db, findings, session_id=sid, project=project,
+                                 origin=row.get("origin"), ts=row.get("ts"),
+                                 source="event",
+                                 trace_id=row.get("trace_id") or "")
+            counts[sid] += len(findings)
+            if truncated:
+                self._mark_truncated(db, sid)
+        except Exception as exc:
+            print(f"security scan: event {row.get('trace_id')!r}: {exc!r}",
+                  file=sys.stderr, flush=True)
+
+    def _replace_session_findings(self, db, session_id, collector, fallback_ts):
+        """Transcript findings are replaced wholesale, which is what makes
+        re-indexing the same snapshot idempotent (AC6)."""
+        db.execute("DELETE FROM security_findings"
+                   " WHERE session_id = ? AND source = 'transcript'", (session_id,))
+        row = db.execute(
+            "SELECT project, origin, first_ts FROM sessions WHERE session_id = ?",
+            (session_id,)).fetchone()
+        self._write_findings(
+            db, collector.findings(), session_id=session_id,
+            project=row["project"] if row else None,
+            origin=row["origin"] if row else None,
+            ts=(row["first_ts"] if row else None) or fallback_ts,
+            source="transcript", trace_id="")
+        if collector.truncated:
+            self._mark_truncated(db, session_id)
 
     # ---- model usage ----
 
@@ -486,14 +671,25 @@ class Store:
         """Derive the session's transcript accounting from `source` (the
         uploaded bytes, or the stored snapshot's Path) without touching any
         file — re-derivation must leave stored snapshots byte-identical."""
+        # The exposure scan rides the parse this already does: one pass over
+        # the snapshot, not two (ADR 0003, cost section).
+        collector = security_scan.TranscriptScan(
+            self.security_salt(),
+            self.security_terms(project or self.session_project(session_id)))
+        on_line = _guarded_line_scan(collector, session_id)
         if isinstance(source, Path):
             size = source.stat().st_size
             with source.open("rb") as fh:
-                turns, lines = transcript_turns(fh)
+                turns, lines = transcript_turns(fh, on_line=on_line)
         else:
             size = len(source)
-            turns, lines = transcript_turns(source)
+            turns, lines = transcript_turns(source, on_line=on_line)
         stats = summarize_turns(turns, lines)
+        # Findings on a snapshot carry no timestamp of their own. Times derived
+        # from the data — the session's first event, else the snapshot's
+        # earliest turn — keep re-indexing idempotent (AC6); the upload time
+        # changes on every upload and is only the last resort.
+        earliest_turn = min((t["ts"] for t in turns if t["ts"]), default=None)
         with self.connect() as db:
             db.execute(
                 """INSERT INTO sessions (session_id, project, origin) VALUES (?,?,?)
@@ -515,6 +711,8 @@ class Store:
                  stats["models"], session_id),
             )
             self._replace_session_models(db, session_id, turns)
+            self._replace_session_findings(db, session_id, collector,
+                                           earliest_turn or updated_at)
             db.commit()
         return {"bytes": size, "lines": stats["lines"]}
 
@@ -525,12 +723,16 @@ class Store:
     # ---- index rebuild (archive is the source of truth) ----
 
     def rebuild_index(self):
+        salt = self.security_salt()  # own connection: see ingest_events
         with self.connect() as db:
             db.execute("DELETE FROM events")
             db.execute("DELETE FROM sessions")
             db.execute("DELETE FROM model_turns")
+            db.execute("DELETE FROM security_findings")
+            db.execute("DELETE FROM security_actions")
             db.commit()
             n = 0
+            scan_state = {"terms": {}, "counts": {}}
             for f in sorted(self.archive_dir.glob("*.jsonl")):
                 for line in f.read_text(encoding="utf-8").splitlines():
                     if not line.strip():
@@ -551,6 +753,7 @@ class Store:
                     )
                     if cur.rowcount:
                         self._bump_session(db, row)
+                        self._scan_event(db, row, salt, scan_state)
                         n += 1
             db.commit()
         self._rederive_all()
@@ -698,9 +901,12 @@ def _turn_key(msg_id: str) -> str:
     return "sha256:" + hashlib.sha256(msg_id.encode("utf-8", "surrogatepass")).hexdigest()
 
 
-def transcript_turns(source):
+def transcript_turns(source, on_line=None):
     """Parse a Claude Code transcript (bytes, or a binary file object read
     line by line) into model turns. Returns (turns, lines).
+
+    `on_line(number, raw)` is called for every non-empty line, 1-based, so a
+    caller can scan the snapshot in this same pass instead of reading it twice.
 
     Claude Code writes one line per content block and repeats the message's
     id and identical usage on every line, so a turn is one distinct
@@ -716,6 +922,8 @@ def transcript_turns(source):
         if not line.strip():
             continue
         lines += 1
+        if on_line is not None:
+            on_line(n + 1, line)
         try:
             e = json.loads(line)
         # ValueError also covers bad UTF-8 and over-long number literals;
@@ -761,6 +969,25 @@ def transcript_turns(source):
             "premium": isinstance(speed, str) and speed != "standard",
         })
     return turns, lines
+
+
+def _guarded_line_scan(collector, session_id):
+    """Per-line scan callback that cannot cost the upload: a scanner bug may
+    lose findings, never a session's token accounting. Reported once per
+    snapshot rather than per line (Principle 8)."""
+    failed = []
+
+    def on_line(number, raw):
+        if failed:
+            return
+        try:
+            collector.line(number, raw)
+        except Exception as exc:
+            failed.append(exc)
+            print(f"security scan: transcript {session_id} line {number}: {exc!r}",
+                  file=sys.stderr, flush=True)
+
+    return on_line
 
 
 def summarize_transcript(source):

@@ -84,3 +84,54 @@ def event(session_id, event_name, ts, **fields):
            "session_id": session_id, "source": fields.pop("source", "claude-code")}
     rec.update(fields)
     return rec
+
+
+# ---------------------------------------------------------------- fake secrets
+#
+# Every secret-shaped value is assembled at runtime from fragments. A complete
+# key-shaped literal in this repository is exactly what gitleaks and semgrep
+# exist to catch, and an allowlist entry to quiet them would violate
+# Constitution Principle 10 — so the literals never exist, instead of being
+# excused. PII values below are the canonical published test numbers (a valid
+# CPF/CNPJ/card shape that belongs to nobody).
+
+_FAKE_FRAGMENTS = {
+    "aws_access_key_id": ("AK", "IA", "ABCDEFGHIJKLMNOP"),
+    "github_token": ("gh", "p_", "0123456789abcdefghijklmnopqrstuvwxyz"),
+    "github_pat": ("github", "_pat_", "11ABCDEFG0abcdefghijkl", "mnopqrstuvwxyz0123456789"),
+    "anthropic_key": ("sk-", "ant-", "api03-", "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6"),
+    "openai_key": ("sk-", "proj-", "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6"),
+    "google_api_key": ("AI", "za", "Sy", "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5"),
+    "slack_token": ("xo", "xb-", "1234567890-0987654321-", "abcdefghijklmnopqrst"),
+    "slack_webhook": ("https://hooks.", "slack.com", "/services/", "T0A1B2C3/B4D5E6F7/", "abcdefghij0123456789"),
+    "npm_token": ("npm", "_", "0123456789abcdefghijklmnopqrstuvwxyz"),
+    "stripe_key": ("sk", "_live_", "0123456789abcdefABCDEF"),
+    "pypi_token": ("pypi-", "AgEIcHlwaS5vcmc", "ABCDEFGHIJKLMNOP"),
+    "vault_token": ("hv", "s.", "A1b2C3d4E5f6G7h8I9j0K1l2"),
+    "private_key_header": ("-----BEGIN RSA ", "PRIVATE KEY", "-----"),
+    "jwt": ("ey", "JhbGciOiJIUzI1NiJ9", ".", "eyJzdWIiOiJ0ZXN0LXVzZXIifQ", ".", "c2lnbmF0dXJl"),
+    "password_value": ("sup3r", "S3cret", "Value42"),
+    "secret_body": ("A1b2", "C3d4E5f6", "G7h8I9j0"),
+}
+
+# Published test values: valid check digits / Luhn, nobody's real data.
+TEST_CPF = "123.456.789-09"
+TEST_CPF_DIGITS = "12345678909"
+TEST_CNPJ = "11.222.333/0001-81"
+TEST_CARD = "4111 1111 1111 1111"
+
+
+def fake(kind: str) -> str:
+    """A fake credential of `kind`, assembled so no complete pattern is ever a
+    literal in the repository (see the note above)."""
+    return "".join(_FAKE_FRAGMENTS[kind])
+
+
+def conn_string() -> str:
+    """A database URL carrying a password, assembled the same way."""
+    return "postgres://appuser:" + fake("password_value") + "@db.internal:5432/app"
+
+
+def assignment(key: str = "api_key") -> str:
+    """A `key = value` line whose value is a plausible secret."""
+    return f'{key} = "' + fake("secret_body") + '"'

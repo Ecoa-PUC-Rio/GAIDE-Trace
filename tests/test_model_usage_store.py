@@ -242,11 +242,14 @@ class SessionModelUsage(StoreTestCase):
             db.commit()
         real = server.transcript_turns
 
-        def explode_on_bad(source):
+        # Passes `on_line` through: the exposure scan rides this same parse
+        # (specs/security-scan), and a stub that drops it would fail every
+        # session instead of the one this test breaks on purpose.
+        def explode_on_bad(source, on_line=None):
             if b"output_tokens\": 1" in source.read():
                 raise RuntimeError("synthetic parser failure")
             source.seek(0)
-            return real(source)
+            return real(source, on_line=on_line)
 
         with mock.patch.object(server, "transcript_turns", side_effect=explode_on_bad), \
                 mock.patch("sys.stderr") as stderr:
