@@ -65,14 +65,35 @@ CATEGORIES = (SECRET, PATH, PII, INTERNAL, REDACTION)
 HIGH, MEDIUM, LOW = "high", "medium", "low"
 SEVERITIES = (HIGH, MEDIUM, LOW)
 
-Rule = namedtuple("Rule", "name category severity pattern validate reveal")
+Rule = namedtuple("Rule", "name category severity pattern validate reveal gate")
+
+# A cheap necessary condition for the digit rules, which have no literal of
+# their own: one C-speed pass stands in for three backtracking ones. Three, not
+# four: a CPF written with separators (123.456.789-09) never has four digits in
+# a row, and a gate the pattern does not imply is a silent false negative.
+DIGIT_RUN_RE = re.compile(r"\d{3}")
 
 
-def _rule(name, category, severity, pattern, validate=None, reveal=EVIDENCE_PREFIX):
+def _rule(name, category, severity, pattern, validate=None,
+          reveal=EVIDENCE_PREFIX, gate=()):
     """A catalogue entry. `reveal` is how many leading characters the evidence
     may carry: four for credentials and paths (enough to tell *which* key to
-    rotate), none for personal data."""
-    return Rule(name, category, severity, re.compile(pattern), validate, reveal)
+    rotate), none for personal data.
+
+    `gate` is a necessary condition for the pattern, checked before the regex
+    runs: a tuple of lowercase literals (any one of which must appear) or a
+    cheap pattern. Substring search is C-speed and these rules are specific,
+    so on ordinary code and tool output nearly the whole catalogue is skipped
+    without the regex engine starting — which is what keeps the scan affordable
+    on the ingest path (Task 20: 33 unconditional passes over the four fields
+    of one maximal record cost ~19 ms, or 3.7 s for a shipping batch).
+
+    A gate that is not genuinely implied by the pattern would be a silent
+    false negative, so every rule's positive case is exercised in the suite and
+    one test compares a gated scan against an ungated one over the whole
+    corpus."""
+    return Rule(name, category, severity, re.compile(pattern), validate,
+                reveal, gate)
 
 
 # ---------------------------------------------------------------- validators
@@ -156,77 +177,111 @@ def _real_secret(value: str) -> bool:
 RULES = (
     # -- credentials ----------------------------------------------------
     _rule("private-key-block", SECRET, HIGH,
-          r"-----BEGIN [A-Z ]{0,30}PRIVATE KEY-----"),
+          r"-----BEGIN [A-Z ]{0,30}PRIVATE KEY-----",
+          gate=("private key",)),
     _rule("aws-access-key-id", SECRET, HIGH,
-          r"\b(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}\b"),
+          r"\b(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}\b",
+          gate=("akia", "asia", "abia", "acca")),
     _rule("github-token", SECRET, HIGH,
-          r"\bgh[pousr]_[A-Za-z0-9]{36}\b"),
+          r"\bgh[pousr]_[A-Za-z0-9]{36}\b",
+          gate=("ghp_", "gho_", "ghu_", "ghs_", "ghr_")),
     _rule("github-token-pat", SECRET, HIGH,
-          r"\bgithub_pat_[A-Za-z0-9_]{22,}"),
+          r"\bgithub_pat_[A-Za-z0-9_]{22,}",
+          gate=("github_pat_",)),
     _rule("anthropic-api-key", SECRET, HIGH,
-          r"\bsk-ant-[A-Za-z0-9_-]{20,}"),
+          r"\bsk-ant-[A-Za-z0-9_-]{20,}",
+          gate=("sk-ant-",)),
     # Anything sk- that is not the Anthropic shape above.
     _rule("openai-api-key", SECRET, HIGH,
-          r"\bsk-(?!ant-)(?:proj-)?[A-Za-z0-9_-]{20,}"),
+          r"\bsk-(?!ant-)(?:proj-)?[A-Za-z0-9_-]{20,}",
+          gate=("sk-",)),
     _rule("google-api-key", SECRET, HIGH,
-          r"\bAIza[0-9A-Za-z_-]{30,}"),
+          r"\bAIza[0-9A-Za-z_-]{30,}",
+          gate=("aiza",)),
     _rule("slack-token", SECRET, HIGH,
-          r"\bxox[abprs]-[A-Za-z0-9-]{10,}"),
+          r"\bxox[abprs]-[A-Za-z0-9-]{10,}",
+          gate=("xox",)),
     _rule("slack-webhook", SECRET, HIGH,
-          r"https://hooks\.slack\.com/services/[A-Za-z0-9/]{10,}"),
+          r"https://hooks\.slack\.com/services/[A-Za-z0-9/]{10,}",
+          gate=("hooks.slack.com",)),
     _rule("npm-token", SECRET, HIGH,
-          r"\bnpm_[A-Za-z0-9]{36}\b"),
+          r"\bnpm_[A-Za-z0-9]{36}\b",
+          gate=("npm_",)),
     _rule("stripe-key", SECRET, HIGH,
-          r"\b[sr]k_live_[A-Za-z0-9]{10,}"),
+          r"\b[sr]k_live_[A-Za-z0-9]{10,}",
+          gate=("_live_",)),
     _rule("pypi-token", SECRET, HIGH,
-          r"\bpypi-AgEIcHlwaS5vcmc[A-Za-z0-9_-]{10,}"),
+          r"\bpypi-AgEIcHlwaS5vcmc[A-Za-z0-9_-]{10,}",
+          gate=("pypi-",)),
     _rule("vault-token", SECRET, HIGH,
-          r"\bhv[sb]\.[A-Za-z0-9_-]{20,}"),
+          r"\bhv[sb]\.[A-Za-z0-9_-]{20,}",
+          gate=("hvs.", "hvb.")),
     _rule("secret-assignment", SECRET, HIGH,
           r"(?i)\b(?:api[_-]?key|secret|token|password|passwd|pwd|credential|"
           r"private[_-]?key|access[_-]?key)\b\s*[:=]\s*[\"']?"
           r"(?P<v>[^\s\"',;]{8,128})",
-          validate=_real_secret),
+          validate=_real_secret,
+          gate=("key", "secret", "token", "password",
+                "passwd", "pwd", "credential")),
     _rule("jwt", SECRET, MEDIUM,
-          r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}"),
+          r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}",
+          gate=("eyj",)),
     _rule("credentials-in-url", SECRET, MEDIUM,
-          r"\b[a-z][a-z0-9+.-]{1,20}://[^\s:/@]{1,64}:(?P<v>[^\s:/@]{1,128})@"),
+          r"\b[a-z][a-z0-9+.-]{1,20}://[^\s:/@]{1,64}:(?P<v>[^\s:/@]{1,128})@",
+          gate=("://",)),
 
     # -- sensitive paths (scanned only where a tool addressed a file) ----
-    _rule("env-file", PATH, HIGH, r"\.env(?:\.[A-Za-z0-9_-]{1,20})?\b"),
+    _rule("env-file", PATH, HIGH, r"\.env(?:\.[A-Za-z0-9_-]{1,20})?\b",
+          gate=(".env",)),
     _rule("private-key-file", PATH, HIGH,
-          r"\.(?:keystore|pem|pfx|p12|jks|key)\b"),
+          r"\.(?:keystore|pem|pfx|p12|jks|key)\b",
+          gate=(".pem", ".key", ".pfx", ".p12", ".jks", ".keystore")),
     _rule("ssh-private-key-file", PATH, HIGH,
-          r"\bid_(?:rsa|dsa|ecdsa|ed25519)\b"),
-    _rule("ssh-dir", PATH, HIGH, r"\.ssh/"),
-    _rule("aws-credentials-file", PATH, HIGH, r"\.aws/(?:credentials|config)\b"),
-    _rule("kube-config", PATH, HIGH, r"\.kube/config\b"),
-    _rule("gcloud-config", PATH, HIGH, r"\.config/gcloud\b"),
-    _rule("docker-config", PATH, HIGH, r"\.docker/config\.json\b"),
-    _rule("netrc", PATH, HIGH, r"\.netrc\b"),
-    _rule("npmrc-or-pypirc", PATH, HIGH, r"\.(?:npmrc|pypirc)\b"),
-    _rule("git-credentials", PATH, HIGH, r"\.git-credentials\b"),
+          r"\bid_(?:rsa|dsa|ecdsa|ed25519)\b",
+          gate=("id_rsa", "id_dsa", "id_ecdsa", "id_ed25519")),
+    _rule("ssh-dir", PATH, HIGH, r"\.ssh/",
+          gate=(".ssh/",)),
+    _rule("aws-credentials-file", PATH, HIGH, r"\.aws/(?:credentials|config)\b",
+          gate=(".aws/",)),
+    _rule("kube-config", PATH, HIGH, r"\.kube/config\b",
+          gate=(".kube/",)),
+    _rule("gcloud-config", PATH, HIGH, r"\.config/gcloud\b",
+          gate=(".config/gcloud",)),
+    _rule("docker-config", PATH, HIGH, r"\.docker/config\.json\b",
+          gate=(".docker/",)),
+    _rule("netrc", PATH, HIGH, r"\.netrc\b",
+          gate=(".netrc",)),
+    _rule("npmrc-or-pypirc", PATH, HIGH, r"\.(?:npmrc|pypirc)\b",
+          gate=(".npmrc", ".pypirc")),
+    _rule("git-credentials", PATH, HIGH, r"\.git-credentials\b",
+          gate=(".git-credentials",)),
 
     # -- personal data (no characters revealed) --------------------------
     _rule("cpf", PII, MEDIUM,
           r"(?<!\d)(?:\d{3}\.\d{3}\.\d{3}-\d{2}|\d{11})(?!\d)",
-          validate=valid_cpf, reveal=0),
+          validate=valid_cpf, reveal=0,
+          gate=DIGIT_RUN_RE),
     _rule("cnpj", PII, MEDIUM,
           r"(?<!\d)(?:\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}|\d{14})(?!\d)",
-          validate=valid_cnpj, reveal=0),
+          validate=valid_cnpj, reveal=0,
+          gate=DIGIT_RUN_RE),
     _rule("credit-card", PII, MEDIUM,
           r"(?<!\d)(?:\d{4}[ -]?){3}\d{4}(?!\d)",
-          validate=valid_card, reveal=0),
+          validate=valid_card, reveal=0,
+          gate=DIGIT_RUN_RE),
     _rule("email", PII, LOW,
           r"\b[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,64}\.[A-Za-z]{2,24}\b",
-          reveal=0),
+          reveal=0,
+          gate=("@",)),
     # Requires the country code: an unanchored 11-digit phone pattern reports
     # every order number in the ledger.
     _rule("phone-br", PII, LOW,
-          r"\+55\s?\(?\d{2}\)?\s?9?\d{4}[-\s]?\d{4}", reveal=0),
+          r"\+55\s?\(?\d{2}\)?\s?9?\d{4}[-\s]?\d{4}", reveal=0,
+          gate=("+55",)),
 
     # -- capture's own redaction (informational) -------------------------
-    _rule("redaction-marker", REDACTION, LOW, r"\[REDACTED\]", reveal=0),
+    _rule("redaction-marker", REDACTION, LOW, r"\[REDACTED\]", reveal=0,
+          gate=("[redacted]",)),
 )
 
 TERM_RULE = "custom-term"
@@ -259,6 +314,20 @@ def mask(value: str, reveal: int = EVIDENCE_PREFIX) -> str:
     return f"{head}\u2026[{len(value)} chars]"
 
 
+def _passes_gate(gate, text, lowered, hits):
+    """Whether a rule's necessary condition holds, so its regex is worth
+    running. Pattern gates are shared between rules, so each is evaluated once
+    per text."""
+    if not gate:
+        return True
+    if isinstance(gate, tuple):
+        return any(literal in lowered for literal in gate)
+    hit = hits.get(id(gate))
+    if hit is None:
+        hit = hits[id(gate)] = gate.search(text) is not None
+    return hit
+
+
 def _finding(rule, value, salt):
     return {
         "category": rule.category,
@@ -281,10 +350,14 @@ def scan_text(text, salt, terms=(), skip_categories=()):
     truncated = False
     if len(text) > MAX_SCAN_CHARS:
         text, truncated = text[:MAX_SCAN_CHARS], True
+    lowered = text.lower()
+    gate_hits = {}
     agg = {}
     capped = False
     for rule in RULES:
         if rule.category in skip_categories:
+            continue
+        if not _passes_gate(rule.gate, text, lowered, gate_hits):
             continue
         for match in rule.pattern.finditer(text):
             value = match.groupdict().get("v") or match.group(0)
@@ -302,7 +375,6 @@ def scan_text(text, salt, terms=(), skip_categories=()):
         if capped:
             break
     if terms and not capped:
-        lowered = text.lower()
         for term in terms:
             needle = term.lower()
             if len(needle) < TERM_MIN_CHARS:

@@ -12,6 +12,7 @@ import io
 import json
 import shutil
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -457,6 +458,73 @@ class TestStoreSalt(StoreCase):
         value = fake("aws_access_key_id")
         self.assertNotEqual(scan.fingerprint(value, self.store.security_salt()),
                             scan.fingerprint(value, other.security_salt()))
+
+
+class TestGating(unittest.TestCase):
+    """The literal gates are an optimization, so they must be invisible: a
+    gate the pattern does not imply would silently stop reporting a rule."""
+
+    def corpus(self):
+        values = [fake(k) for k in (
+            "aws_access_key_id", "github_token", "github_pat", "anthropic_key",
+            "openai_key", "google_api_key", "slack_token", "slack_webhook",
+            "npm_token", "stripe_key", "pypi_token", "vault_token",
+            "private_key_header", "jwt")]
+        values += [fixtures.conn_string(), fixtures.assignment(),
+                   fixtures.assignment("password"), fixtures.assignment("access-key"),
+                   TEST_CPF, TEST_CPF_DIGITS, TEST_CNPJ, TEST_CARD,
+                   "ana.silva@example.com", "+55 11 98765-4321",
+                   "[REDACTED]", "acme-holdings",
+                   "cat .env", "cat ~/.aws/credentials", "cp ~/.ssh/id_ed25519 .",
+                   "openssl rsa -in server.pem", "KUBECONFIG=~/.kube/config x",
+                   "ls ~/.config/gcloud", "cat ~/.docker/config.json",
+                   "cat ~/.netrc", "cat ~/.npmrc", "cat ~/.pypirc",
+                   "cat ~/.git-credentials", "id_rsa", "id_ecdsa", "a.keystore",
+                   # negatives and near misses
+                   "source .envrc", "the id_rsandom file", "order 12345678901",
+                   "id 4111 1111 1111 1112", "111.111.111-11", "for key in d:",
+                   "npm install", "plain prose with no secret at all"]
+        return [f"line before\n{v}\nline after" for v in values]
+
+    def test_gating_never_changes_the_findings(self):
+        gate_free = tuple(r._replace(gate=()) for r in scan.RULES)
+        for text in self.corpus():
+            with self.subTest(text=text[12:40]):
+                gated, _ = scan.scan_text(text, SALT, terms=("acme-holdings",))
+                with mock.patch.object(scan, "RULES", gate_free):
+                    ungated, _ = scan.scan_text(text, SALT, terms=("acme-holdings",))
+                self.assertEqual(sorted(f["rule"] for f in gated),
+                                 sorted(f["rule"] for f in ungated))
+
+    def test_every_gate_is_a_tuple_of_lowercase_literals_or_a_pattern(self):
+        for rule in scan.RULES:
+            with self.subTest(rule=rule.name):
+                if isinstance(rule.gate, tuple):
+                    for literal in rule.gate:
+                        self.assertEqual(literal, literal.lower())
+                else:
+                    self.assertTrue(hasattr(rule.gate, "search"))
+
+
+class TestScanBudget(unittest.TestCase):
+    """Task 20 — the ingest path pays this per record, so it has a budget.
+
+    Capture ships up to GAIDE_TRACE_MAX_FIELD (20 000) characters per field and
+    the hook ships up to 200 records per request against a 5 s timeout, so a
+    maximal record must stay far below 25 ms. Before the gates it was ~19 ms,
+    which is 3.7 s for one batch; the threshold here fails if that returns."""
+
+    def test_a_maximal_record_of_ordinary_code_scans_fast(self):
+        field = ("def handler(event, context):\n"
+                 "    user = db.get(event['id'])\n"
+                 "    return {'ok': True, 'name': user.name}\n" * 300)[:20_000]
+        row = {f: field for f in scan.EVENT_TEXT_FIELDS}
+        start = time.monotonic()
+        for _ in range(10):
+            scan.scan_event(row, SALT)
+        per_record = (time.monotonic() - start) / 10
+        self.assertLess(per_record, 0.005,
+                        f"{per_record * 1000:.1f} ms/record is over the budget")
 
 
 if __name__ == "__main__":
