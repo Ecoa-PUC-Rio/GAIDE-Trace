@@ -81,7 +81,8 @@ VERSION = "0.6.0"
 #   1 — transcript usage counted once per message, placeholder models dropped
 #   2 — session time ranges lost to a transcript-first arrival are restored
 #   3 — per-turn model usage (model_turns) and each session's dominant model
-DERIVED_VERSION = 3
+#   4 — security analysis: exposure findings, security actions, code edits
+DERIVED_VERSION = 4
 PROGRESS_EVERY_SECONDS = 5
 
 # Model names come from ingested data an agent key controls; cap what the
@@ -443,6 +444,7 @@ class Store:
             for row in accepted:
                 self._bump_session(db, row)
                 self._scan_event(db, row, salt, scan_state)
+                self._record_actions(db, row)
                 if self._add_event_turn(db, row):
                     touched.add(row["session_id"])
             for sid in touched:
@@ -488,6 +490,11 @@ class Store:
         elif ev == "tool.fail":
             db.execute("UPDATE sessions SET failures = failures + 1 WHERE session_id = ?",
                        (row["session_id"],))
+        # A failed write changed nothing, so only successful calls count: this
+        # is the denominator of the coverage figure (AC12).
+        if ev == "tool.call" and security_scan.is_code_edit(row):
+            db.execute("UPDATE sessions SET code_edits = code_edits + 1"
+                       " WHERE session_id = ?", (row["session_id"],))
 
     # ---- security analysis (specs/security-scan) ----
 
@@ -574,6 +581,88 @@ class Store:
         except Exception as exc:
             print(f"security scan: event {row.get('trace_id')!r}: {exc!r}",
                   file=sys.stderr, flush=True)
+
+    def _record_actions(self, db, row):
+        """Security activity evidenced by one record. Same contract as the
+        exposure scan: a classifier failure is logged and costs the action,
+        never the record (Principle 8)."""
+        try:
+            actions = security_scan.classify_tool_call(row)
+            if not actions:
+                return
+            db.executemany(
+                """INSERT OR IGNORE INTO security_actions
+                     (trace_id, session_id, project, origin, ts, category, tool,
+                      outcome, detail)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                [(row.get("trace_id") or "", row["session_id"], row.get("project"),
+                  row.get("origin"), row.get("ts"), a["category"], a["tool"],
+                  a["outcome"], a["detail"]) for a in actions])
+        except Exception as exc:
+            print(f"security scan: actions of event {row.get('trace_id')!r}: {exc!r}",
+                  file=sys.stderr, flush=True)
+
+    def rescan_security(self, project=None, with_transcripts=True, progress=None):
+        """Recompute the security analysis of every session (or of one
+        project's) from the indexed events and the stored snapshots.
+
+        This is what the version bump runs on an upgrade, what `scan-security`
+        runs by hand and what a term change needs: terms apply to data arriving
+        from now on immediately, but stored findings only change when the
+        stored data is read again. One session at a time, each in its own
+        transaction, so a long rescan never holds the writer against live
+        ingest."""
+        salt = self.security_salt()
+        where, params = ("", [])
+        if project is not None:
+            where, params = (" WHERE project = ?", [project])
+        with self.connect() as db:
+            session_ids = [r[0] for r in db.execute(
+                f"SELECT session_id FROM sessions{where} ORDER BY session_id",
+                params)]
+        transcripts, failed = 0, []
+        last_report = time.monotonic()
+        for done, sid in enumerate(session_ids, 1):
+            try:
+                with self.connect() as db:
+                    db.execute("DELETE FROM security_findings"
+                               " WHERE session_id = ? AND source = 'event'", (sid,))
+                    db.execute("DELETE FROM security_actions WHERE session_id = ?",
+                               (sid,))
+                    db.execute("UPDATE sessions SET code_edits = 0,"
+                               " security_truncated = 0 WHERE session_id = ?", (sid,))
+                    state = {"terms": {}, "counts": {}}
+                    edits = 0
+                    rows = db.execute(
+                        f"SELECT {','.join(EVENT_COLUMNS)} FROM events"
+                        " WHERE session_id = ? ORDER BY ts", (sid,)).fetchall()
+                    for row in (dict(r) for r in rows):
+                        self._scan_event(db, row, salt, state)
+                        self._record_actions(db, row)
+                        if (row.get("event") == "tool.call"
+                                and security_scan.is_code_edit(row)):
+                            edits += 1
+                    db.execute("UPDATE sessions SET code_edits = ?"
+                               " WHERE session_id = ?", (edits, sid))
+                    db.commit()
+                snapshot = self.transcript_path(sid) if with_transcripts else None
+                if snapshot is not None:
+                    uploaded = datetime.fromtimestamp(
+                        snapshot.stat().st_mtime, timezone.utc).isoformat()
+                    self.index_transcript(sid, snapshot, None, None, uploaded)
+                    transcripts += 1
+            except Exception as exc:
+                # Stored data was written by clients an agent key controls: one
+                # session that cannot be scanned is logged and skipped, never
+                # fatal to the whole rescan.
+                failed.append(sid)
+                print(f"security rescan: skipped session {sid}: {exc!r}",
+                      file=sys.stderr, flush=True)
+            if progress and time.monotonic() - last_report >= PROGRESS_EVERY_SECONDS:
+                progress(done, len(session_ids))
+                last_report = time.monotonic()
+        return {"sessions": len(session_ids), "transcripts": transcripts,
+                "failed": failed}
 
     def _replace_session_findings(self, db, session_id, collector, fallback_ts):
         """Transcript findings are replaced wholesale, which is what makes
@@ -754,6 +843,7 @@ class Store:
                     if cur.rowcount:
                         self._bump_session(db, row)
                         self._scan_event(db, row, salt, scan_state)
+                        self._record_actions(db, row)
                         n += 1
             db.commit()
         self._rederive_all()
@@ -846,13 +936,19 @@ class Store:
             return None
         started = time.monotonic()
         self._repair_session_times()
+        # The events pass covers findings, actions and code edits; the
+        # transcript pass below rescans the snapshots through index_transcript,
+        # so this one does not read them twice.
+        security = self.rescan_security(with_transcripts=False, progress=progress)
         transcripts, failed = self._rederive_all(progress)
         # Recorded even with failures: they are logged per session, and a
         # session re-derives on its next transcript upload or rebuild-index
         # (events-only sessions have no upload, so only the latter).
         self._set_derived_version(DERIVED_VERSION)
         return {"from": found, "to": DERIVED_VERSION, "transcripts": transcripts,
-                "failed": failed, "seconds": round(time.monotonic() - started, 2)}
+                "failed": failed + [s for s in security["failed"] if s not in failed],
+                "sessions_scanned": security["sessions"],
+                "seconds": round(time.monotonic() - started, 2)}
 
 
 # Model values that name no real model: Claude Code stamps "<synthetic>" on
@@ -2311,6 +2407,11 @@ def main():
 
     sub.add_parser("rebuild-index", help="rebuild SQLite index from the JSONL archive")
 
+    p_scan = sub.add_parser("scan-security",
+                            help="re-run the security analysis over stored data")
+    p_scan.add_argument("--project", default=None,
+                        help="only this project (default: every session)")
+
     args = parser.parse_args()
     if args.cmd in (None, "serve"):
         if args.cmd is None:  # bare invocation: behave like `serve` with defaults
@@ -2359,6 +2460,16 @@ def main():
     elif args.cmd == "rebuild-index":
         n = store.rebuild_index()
         print(f"index rebuilt: {n} events")
+    elif args.cmd == "scan-security":
+        summary = store.rescan_security(
+            project=args.project,
+            progress=lambda done, total: print(
+                f"scanning: {done}/{total} sessions", flush=True))
+        print(f"security analysis: {summary['sessions']} sessions, "
+              f"{summary['transcripts']} transcripts")
+        if summary["failed"]:
+            print(f"WARNING: {len(summary['failed'])} sessions skipped "
+                  "(logged above)")
 
 
 if __name__ == "__main__":

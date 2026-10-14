@@ -180,7 +180,7 @@ session's transcript findings wholesale so re-indexing is idempotent.
 
 ## Task 9 — Activity catalogue and classification
 
-**Status:** pending
+**Status:** done
 
 **Files:** `server/security_scan.py`, `tests/test_security_scan.py`
 
@@ -191,11 +191,11 @@ catalogue for `sast`, `sca`, `secrets`, `iac`, `container`, `dast`,
 `unknown` — never guessed). Classification reads only `tool.call`/`tool.fail`.
 
 **Done when:**
-- [ ] Positive cases across all categories classify with the right tool
-- [ ] A scanner merely named in a prompt or an assistant message yields nothing
+- [x] Positive cases across all categories classify with the right tool
+- [x] A scanner merely named in a prompt or an assistant message yields nothing
   (AC9)
-- [ ] `tool.fail` → `error`; an ambiguous response → `unknown` (AC10)
-- [ ] Removing the GAIDE entries leaves non-GAIDE behaviour unchanged (AC14)
+- [x] `tool.fail` → `error`; an ambiguous response → `unknown` (AC10)
+- [x] Removing the GAIDE entries leaves non-GAIDE behaviour unchanged (AC14)
 
 **Estimate:** ~60 min · **Depends on:** Task 3
 
@@ -203,7 +203,7 @@ catalogue for `sast`, `sca`, `secrets`, `iac`, `container`, `dast`,
 
 ## Task 10 — Suppression signals
 
-**Status:** pending
+**Status:** done
 
 **Files:** `server/security_scan.py`, `server/gaide_trace_server.py`,
 `tests/test_security_scan.py`
@@ -213,8 +213,8 @@ added to scanner ignore files, `--no-verify` and `SKIP=` on pre-commit; store
 them in the `suppression` category.
 
 **Done when:**
-- [ ] Each signal is detected with its session, time and what was suppressed
-- [ ] Suppressions never appear in action counts or coverage (AC11)
+- [x] Each signal is detected with its session, time and what was suppressed
+- [x] Suppressions never appear in action counts or coverage (AC11)
 
 **Estimate:** ~45 min · **Depends on:** Task 9
 
@@ -222,7 +222,7 @@ them in the `suppression` category.
 
 ## Task 11 — Code-touching sessions
 
-**Status:** pending
+**Status:** done
 
 **Files:** `server/gaide_trace_server.py`, `server/security_scan.py`,
 `tests/test_security_api.py`
@@ -232,9 +232,9 @@ commands), the `sessions.code_edits` counter bumped in `_bump_session`, and the
 SQL that recomputes it during re-derivation.
 
 **Done when:**
-- [ ] A seeded session's `code_edits` is correct through ingest and through
+- [x] A seeded session's `code_edits` is correct through ingest and through
   re-derivation
-- [ ] Sessions with no code edit are excluded from coverage and gaps (AC12)
+- [x] Sessions with no code edit are excluded from coverage and gaps (AC12)
 
 **Estimate:** ~45 min · **Depends on:** Tasks 6, 9
 
@@ -242,7 +242,7 @@ SQL that recomputes it during re-derivation.
 
 ## Task 12 — Derivation, rebuild and the `scan-security` command
 
-**Status:** pending
+**Status:** done
 
 **Files:** `server/gaide_trace_server.py`, `tests/test_security_api.py`
 
@@ -252,12 +252,12 @@ inside `_rederive_all` with the existing progress reporting; make
 [--project]` CLI command for ops.
 
 **Done when:**
-- [ ] A copied v0.6.0 store is scanned once at the first start, before binding,
+- [x] A copied v0.6.0 store is scanned once at the first start, before binding,
   with progress (AC33)
-- [ ] `rebuild-index` produces identical security tables and leaves snapshots
+- [x] `rebuild-index` produces identical security tables and leaves snapshots
   byte-identical
-- [ ] A second start does not re-scan
-- [ ] One unparsable session is skipped and logged, not fatal
+- [x] A second start does not re-scan
+- [x] One unparsable session is skipped and logged, not fatal
 
 **Estimate:** ~60 min · **Depends on:** Tasks 7, 8, 11
 
@@ -413,7 +413,7 @@ ranking anywhere.
 
 ## Task 20 — Measure cost and noise on real data
 
-**Status:** pending
+**Status:** in-progress (cost measured 2026-10-14; see PROGRESS.md)
 
 **Files:** `specs/security-scan/plan.md` (results), `PROGRESS.md`
 
@@ -457,20 +457,20 @@ passes: `code-reviewer`, the mandatory `security-reviewer`, and an independent
 
 | Spec criterion | Task(s) | Status |
 | --- | --- | --- |
-| AC1 (everything scanned) | 3, 7, 8, 12 | pending |
+| AC1 (everything scanned) | 3, 7, 8, 12 | done (tests green) |
 | AC2 (rule catalogue) | 2, 3, 4 | done (tests green) |
 | AC3 (finding fields) | 3, 5, 6 | done (tests green) |
 | AC4 (severities) | 3, 21 | pending |
 | AC5 (repeats collapse) | 3 | done (tests green) |
-| AC6 (idempotent, snapshots intact) | 8, 12 | pending |
+| AC6 (idempotent, snapshots intact) | 8, 12 | done (tests green) |
 | AC7 (check digits / Luhn) | 4 | done (tests green) |
-| AC8 (activity categories) | 9, 21 | pending |
-| AC9 (only invoked commands) | 9 | pending |
-| AC10 (outcome never guessed) | 9 | pending |
-| AC11 (suppressions separate) | 10 | pending |
+| AC8 (activity categories) | 9, 21 | done (tests green) |
+| AC9 (only invoked commands) | 9 | done (tests green) |
+| AC10 (outcome never guessed) | 9 | done (tests green) |
+| AC11 (suppressions separate) | 10 | done (tests green) |
 | AC12 (coverage) | 11, 13 | pending |
 | AC13 (gap list) | 11, 13 | pending |
-| AC14 (no GAIDE dependency) | 9 | pending |
+| AC14 (no GAIDE dependency) | 9 | done (tests green) |
 | AC15 (aggregate endpoint) | 13 | pending |
 | AC16 (session block) | 14 | pending |
 | AC17 (export) | 15 | pending |
@@ -489,7 +489,7 @@ passes: `code-reviewer`, the mandatory `security-reviewer`, and an independent
 | AC30 (stated limits) | 19 | pending |
 | AC31 (admin-only controls, no ranking) | 19 | pending |
 | AC32 (chart conventions) | 18 | pending |
-| AC33 (upgrade scan) | 12 | pending |
+| AC33 (upgrade scan) | 12 | done (tests green) |
 | AC34 (documentation) | 21 | pending |
 
 > A criterion reaches `verified` only when exercised against the running
