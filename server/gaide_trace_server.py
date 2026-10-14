@@ -715,6 +715,11 @@ class Store:
                 params)]
         transcripts, failed = 0, []
         last_report = time.monotonic()
+        # Reported before the loop and after it, not only by the throttle: a
+        # rescan that finishes inside the window would otherwise never tell the
+        # console how many sessions it had to do.
+        if progress:
+            progress(0, len(session_ids))
         for done, sid in enumerate(session_ids, 1):
             try:
                 with self.connect() as db:
@@ -755,6 +760,8 @@ class Store:
             if progress and time.monotonic() - last_report >= PROGRESS_EVERY_SECONDS:
                 progress(done, len(session_ids))
                 last_report = time.monotonic()
+        if progress:
+            progress(len(session_ids), len(session_ids))
         if project is None and with_transcripts:
             # Only a complete pass can claim the whole store was scanned, and
             # only once it is done: that is what the console's staleness notice
@@ -2556,8 +2563,8 @@ class Handler(BaseHTTPRequestHandler):
         if not ident:
             return
         payload = self._json_body()
-        if payload is None:
-            return
+        if not isinstance(payload, dict):
+            return self.send_error_json(400, "body must be a JSON object")
         terms = payload.get("terms")
         if not isinstance(terms, list):
             return self.send_error_json(400, "terms must be a list")
@@ -2613,8 +2620,8 @@ class Handler(BaseHTTPRequestHandler):
         if not ident:
             return
         payload = self._json_body()
-        if payload is None:
-            return
+        if not isinstance(payload, dict):
+            return self.send_error_json(400, "body must be a JSON object")
         project = payload.get("project") or None
         if project is not None and not (
                 isinstance(project, str) and PROJECT_NAME_RE.match(project)):

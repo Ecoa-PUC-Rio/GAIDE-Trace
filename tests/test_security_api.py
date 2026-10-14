@@ -355,6 +355,19 @@ class TestTerms(SecurityApiTestCase):
         status, _ = self.put("admin_user", terms)
         self.assertEqual(status, 400)
 
+    def test_a_body_that_is_not_an_object_is_answered_not_dropped(self):
+        """Found by the verifier: these two handlers returned without sending
+        anything, so the client got an empty reply — and a JSON array raised
+        inside the handler while it waited."""
+        for path in ("/api/v1/security/terms", "/api/v1/security/rescan"):
+            method = "PUT" if path.endswith("terms") else "POST"
+            for body in (b"not json", b"[1,2,3]", b'"a string"', b"42", b"null"):
+                with self.subTest(path=path, body=body):
+                    status, raw = self.h.raw_request(
+                        method, path, self.tokens["admin_user"], body)
+                    self.assertEqual(status, 400, raw)
+                    self.assertIn(b"JSON object", raw)
+
     def test_invalid_terms_are_rejected_without_changing_anything(self):
         self.put("admin_user", [{"project": "app", "term": "keepme-please"}])
         bad = [
@@ -401,6 +414,9 @@ class TestRescan(SecurityApiTestCase):
         final = TestTerms.wait_for_rescan(self)
         self.assertEqual(final["state"], "done")
         self.assertEqual(final["sessions"], 4)
+        # `total` must not stay null for a job that finished inside the
+        # progress throttle window (verifier note on AC19).
+        self.assertEqual((final["done"], final["total"]), (4, 4))
         self.assertEqual(final["failed"], [])
         self.assertIsNotNone(final["finished_at"])
 

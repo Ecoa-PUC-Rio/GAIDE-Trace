@@ -55,7 +55,7 @@ and semgrep would (correctly) flag in CI.
 
 ## Task 3 — Scanner module: catalogue, scan_text, masking, caps
 
-**Status:** done
+**Status:** verified
 
 **Files:** `server/security_scan.py`, `tests/test_security_scan.py`
 
@@ -77,7 +77,7 @@ reported rather than silent. Every pattern linear — no nested quantifiers.
 
 ## Task 4 — Validators: CPF, CNPJ check digits and Luhn
 
-**Status:** done
+**Status:** verified
 
 **Files:** `server/security_scan.py`, `tests/test_security_scan.py`
 
@@ -95,7 +95,7 @@ cannot be a CPF, CNPJ or card number is not reported as one (AC7).
 
 ## Task 5 — Fingerprints and the per-store salt
 
-**Status:** done
+**Status:** verified
 
 **Files:** `server/security_scan.py`, `server/gaide_trace_server.py`,
 `tests/test_security_scan.py`
@@ -116,7 +116,7 @@ random salt generated once per store in `meta`, never served by any endpoint.
 
 ## Task 6 — Schema: findings, actions, terms, code_edits
 
-**Status:** done
+**Status:** verified
 
 **Files:** `server/gaide_trace_server.py`, `tests/test_security_api.py`
 
@@ -157,7 +157,7 @@ continue when the scan of one record raises — the record is still stored
 
 ## Task 8 — Scan transcripts on indexing
 
-**Status:** done
+**Status:** verified
 
 **Files:** `server/gaide_trace_server.py`, `server/security_scan.py`,
 `tests/test_security_scan.py`
@@ -180,7 +180,7 @@ session's transcript findings wholesale so re-indexing is idempotent.
 
 ## Task 9 — Activity catalogue and classification
 
-**Status:** done
+**Status:** verified
 
 **Files:** `server/security_scan.py`, `tests/test_security_scan.py`
 
@@ -203,7 +203,7 @@ catalogue for `sast`, `sca`, `secrets`, `iac`, `container`, `dast`,
 
 ## Task 10 — Suppression signals
 
-**Status:** done
+**Status:** verified
 
 **Files:** `server/security_scan.py`, `server/gaide_trace_server.py`,
 `tests/test_security_scan.py`
@@ -222,7 +222,7 @@ them in the `suppression` category.
 
 ## Task 11 — Code-touching sessions
 
-**Status:** done
+**Status:** verified
 
 **Files:** `server/gaide_trace_server.py`, `server/security_scan.py`,
 `tests/test_security_api.py`
@@ -242,7 +242,7 @@ SQL that recomputes it during re-derivation.
 
 ## Task 12 — Derivation, rebuild and the `scan-security` command
 
-**Status:** done
+**Status:** verified
 
 **Files:** `server/gaide_trace_server.py`, `tests/test_security_api.py`
 
@@ -267,7 +267,7 @@ inside `_rederive_all` with the existing progress reporting; make
 
 ## Task 13 — `GET /api/v1/security`
 
-**Status:** done
+**Status:** verified
 
 **Files:** `server/gaide_trace_server.py`, `tests/test_security_api.py`
 
@@ -291,7 +291,7 @@ Reuses `_filters` and `scope_sql`.
 
 ## Task 14 — Session detail gains a `security` block
 
-**Status:** done
+**Status:** verified
 
 **Files:** `server/gaide_trace_server.py`, `tests/test_security_api.py`
 
@@ -309,7 +309,7 @@ evidence) and actions, additive to the existing response.
 
 ## Task 15 — `GET /api/v1/security/export`
 
-**Status:** done
+**Status:** verified
 
 **Files:** `server/gaide_trace_server.py`, `tests/test_security_api.py`
 
@@ -327,7 +327,7 @@ caller's scope and the same filters as the page.
 
 ## Task 16 — Custom term endpoints
 
-**Status:** done
+**Status:** verified
 
 **Files:** `server/gaide_trace_server.py`, `tests/test_security_api.py`
 
@@ -349,7 +349,7 @@ stale for the affected projects.
 
 ## Task 17 — Rescan endpoints
 
-**Status:** done
+**Status:** verified
 
 **Files:** `server/gaide_trace_server.py`, `tests/test_security_api.py`
 
@@ -371,7 +371,7 @@ start, progress and last result, including a failure (Principle 8).
 
 ## Task 18 — Console: the Security page
 
-**Status:** done
+**Status:** verified
 
 **Files:** `server/webui/security.js`, `server/webui/app.js`,
 `server/webui/index.html`, `server/webui/style.css`
@@ -392,7 +392,7 @@ shared project/date filter.
 
 ## Task 19 — Console: session section, admin controls, honest limits
 
-**Status:** done
+**Status:** verified
 
 **Files:** `server/webui/app.js`, `server/webui/security.js`,
 `server/webui/style.css`
@@ -433,7 +433,7 @@ only on derivation/rescan).
 
 ## Task 21 — Documentation and reviews
 
-**Status:** in-progress (docs done; code + security reviews closed, verifier pass outstanding)
+**Status:** done
 
 **Files:** `docs/SERVER.md`, `README.md`, `docs/adr/0003-*.md`, `PROGRESS.md`
 
@@ -447,8 +447,8 @@ passes: `code-reviewer`, the mandatory `security-reviewer`, and an independent
 - [x] `docs/SERVER.md` and `README.md` updated (AC34)
 - [x] ADR 0003 accepted
 - [x] Code review and security review closed: 4 blockers + 14 suggestions fixed, no suppression
-- [ ] Independent `verifier` pass
-- [ ] `./init.sh` green; `PROGRESS.md` entry appended
+- [x] Independent `verifier` pass: 32/34 observed on a running server; the one failure fixed and re-verified; AC27 is not reachable from a client and says so
+- [x] `./init.sh` green; `PROGRESS.md` entry appended
 
 **Estimate:** ~90 min · **Depends on:** Tasks 18, 19, 20
 
@@ -458,40 +458,40 @@ passes: `code-reviewer`, the mandatory `security-reviewer`, and an independent
 
 | Spec criterion | Task(s) | Status |
 | --- | --- | --- |
-| AC1 (everything scanned) | 3, 7, 8, 12 | done (tests green) |
-| AC2 (rule catalogue) | 2, 3, 4 | done (tests green) |
-| AC3 (finding fields) | 3, 5, 6 | done (tests green) |
-| AC4 (severities) | 3, 21 | done (tests + docs) |
-| AC5 (repeats collapse) | 3 | done (tests green) |
-| AC6 (idempotent, snapshots intact) | 8, 12 | done (tests green) |
-| AC7 (check digits / Luhn) | 4 | done (tests green) |
-| AC8 (activity categories) | 9, 21 | done (tests green) |
-| AC9 (only invoked commands) | 9 | done (tests green) |
-| AC10 (outcome never guessed) | 9 | done (tests green) |
-| AC11 (suppressions separate) | 10 | done (tests green) |
-| AC12 (coverage) | 11, 13 | done (tests green) |
-| AC13 (gap list) | 11, 13 | done (tests green) |
-| AC14 (no GAIDE dependency) | 9 | done (tests green) |
-| AC15 (aggregate endpoint) | 13 | done (tests green) |
-| AC16 (session block) | 14 | done (tests green) |
-| AC17 (export) | 15 | done (tests green) |
-| AC18 (term endpoints) | 16 | done (tests green) |
-| AC19 (rescan) | 17 | done (tests green) |
-| AC20 (scope on every read) | 13, 14, 15 | done (tests green) |
-| AC21 (no value stored or served) | 3, 15 | done (tests green) |
-| AC22 (salted fingerprints) | 5 | done (tests green) |
-| AC23 (no cross-project oracle) | 13, 15 | done (tests green) |
-| AC24 (admin-only endpoints) | 16, 17 | done (tests green) |
-| AC25 (terms are literal) | 16 | done (tests green) |
-| AC26 (bounded scanning) | 3, 8, 13 | done (tests green) |
-| AC27 (ingest survives a scan failure) | 7 | done (tests green) |
-| AC28 (Security page) | 18 | done (verified by hand) |
-| AC29 (session page) | 19 | done (verified by hand) |
-| AC30 (stated limits) | 19 | done (verified by hand) |
-| AC31 (admin-only controls, no ranking) | 19 | done (verified by hand) |
-| AC32 (chart conventions) | 18 | done (verified by hand) |
-| AC33 (upgrade scan) | 12 | done (tests green) |
-| AC34 (documentation) | 21 | done |
+| AC1 (everything scanned) | 3, 7, 8, 12 | verified |
+| AC2 (rule catalogue) | 2, 3, 4 | verified |
+| AC3 (finding fields) | 3, 5, 6 | verified |
+| AC4 (severities) | 3, 21 | verified |
+| AC5 (repeats collapse) | 3 | verified |
+| AC6 (idempotent, snapshots intact) | 8, 12 | verified |
+| AC7 (check digits / Luhn) | 4 | verified |
+| AC8 (activity categories) | 9, 21 | verified |
+| AC9 (only invoked commands) | 9 | verified |
+| AC10 (outcome never guessed) | 9 | verified |
+| AC11 (suppressions separate) | 10 | verified |
+| AC12 (coverage) | 11, 13 | verified |
+| AC13 (gap list) | 11, 13 | verified |
+| AC14 (no GAIDE dependency) | 9 | verified |
+| AC15 (aggregate endpoint) | 13 | verified |
+| AC16 (session block) | 14 | verified |
+| AC17 (export) | 15 | verified |
+| AC18 (term endpoints) | 16 | verified |
+| AC19 (rescan) | 17 | verified |
+| AC20 (scope on every read) | 13, 14, 15 | verified |
+| AC21 (no value stored or served) | 3, 15 | verified |
+| AC22 (salted fingerprints) | 5 | verified |
+| AC23 (no cross-project oracle) | 13, 15 | verified |
+| AC24 (admin-only endpoints) | 16, 17 | verified |
+| AC25 (terms are literal) | 16 | verified |
+| AC26 (bounded scanning) | 3, 8, 13 | verified |
+| AC27 (ingest survives a scan failure) | 7 | done (unit, fault-injected) — not reachable from a client, so not observable |
+| AC28 (Security page) | 18 | verified |
+| AC29 (session page) | 19 | verified |
+| AC30 (stated limits) | 19 | verified |
+| AC31 (admin-only controls, no ranking) | 19 | verified |
+| AC32 (chart conventions) | 18 | verified |
+| AC33 (upgrade scan) | 12 | verified |
+| AC34 (documentation) | 21 | verified |
 
 > A criterion reaches `verified` only when exercised against the running
 > application by someone other than its implementer, not by green unit tests.
