@@ -289,6 +289,12 @@ the login endpoint).
 | `GET /api/v1/models` | member | `{models, omitted}`: the 500 most-used models seen (turns, sessions, last use) plus every priced model, each with its `price` or `null`; `omitted` counts seen models beyond the 500 |
 | `PUT /api/v1/models/prices` | admin | set a price: `{model, input, output, cache_read, cache_write_5m, cache_write_1h}` in USD per million tokens, each 0–10000 |
 | `DELETE /api/v1/models/prices?model=` | admin | clear a model's price |
+| `GET /api/v1/security?project&from&to` | member | the security analysis for the window: `exposure`, `activity`, `scan` (see §7.2) |
+| `GET /api/v1/security/export?kind=findings\|actions&format=jsonl\|csv&project&session&from&to` | member | the rows behind that page |
+| `GET /api/v1/security/terms` | admin | the custom term list |
+| `PUT /api/v1/security/terms` | admin | replace it: `{"terms": [{"project": "app", "term": "acme-holdings"}]}` (`project: ""` = every project) |
+| `POST /api/v1/security/rescan` | admin | re-run the analysis over stored data (`{"project": "app"}` optional) → 202, or 409 if one is running |
+| `GET /api/v1/security/rescan` | admin | that job's state, progress and last result |
 | `GET /api/v1/sessions/<id>/transcript` | member | raw transcript download |
 | `GET /api/v1/export?format=jsonl\|csv&project&session&origin&event&from&to` | member | filtered event export |
 | `GET /api/v1/projects/manage`, `POST /api/v1/projects`, `POST .../<id>/rotate` | member | registered projects + install-prompt keys |
@@ -302,7 +308,7 @@ The export format is the same schema as the local store
 (`schema/event.schema.json`) plus `origin` (key name) and `received_at` —
 `analysis/load_trace.py` loads server exports unchanged.
 
-### Model usage and cost estimates
+### 7.1 Model usage and cost estimates
 
 The server attributes every **model turn** to the model that produced it:
 
@@ -373,6 +379,111 @@ through `PUT /api/v1/models/prices` like a hand edit, with the admin as author.
   CORS, a 15-second timeout, a malformed or oversized feed) shows an error and
   changes nothing; hand pricing is unaffected.
 
+### 7.2 Security analysis — exposure and activity
+
+The server reads the text it already stores — the indexed event fields and the
+transcript snapshots — and reports two things ([spec](../specs/security-scan/spec.md),
+[ADR 0003](adr/0003-derive-security-analysis-in-the-index.md)). Like model
+usage, this is **derived index data**: rebuildable from the JSONL archive and
+the snapshots, scanned at ingest and at transcript upload, re-derived once on
+the first start of a new version, and reproduced by `rebuild-index`.
+
+**What it is not:** the server does not run semgrep, gitleaks, osv-scanner or
+anything else, and never reads your repository. It classifies what the ledger
+recorded.
+
+**1. Exposure findings.** A finding says *a rule matched, in this location, in
+this session* — never the matched value. It carries masked evidence (at most
+the first four characters plus a length) and a fingerprint
+(`HMAC-SHA256` over a per-store random salt that no endpoint serves), so one
+value can be followed across sessions without being stored anywhere.
+
+| Category | Severity | Rules |
+|---|---|---|
+| `secret` | high | private key blocks, AWS access key ids, GitHub (classic + PAT), Anthropic, OpenAI-style, Google, Slack (token + webhook), npm, Stripe live, PyPI and Vault tokens, and `key = value` assignments whose key names a secret |
+| `secret` | medium | JWTs, URLs and connection strings carrying a password |
+| `sensitive-path` | high | `.env*`, `*.pem\|key\|pfx\|p12\|jks\|keystore`, `id_rsa*`, `.ssh/`, `.aws/credentials`, `.kube/config`, `.config/gcloud`, `.docker/config.json`, `.netrc`, `.npmrc`, `.pypirc`, `.git-credentials` |
+| `pii` | medium | CPF and CNPJ (check digits validated), card numbers (Luhn) |
+| `pii` | low | e-mail addresses, Brazilian phone numbers (`+55` required) |
+| `internal` | medium | the custom terms an admin configured |
+| `redaction` | low | `[REDACTED]` markers — what capture-time redaction already caught |
+
+Sensitive-path rules apply only where a tool addressed a file: an event's
+`tool_input`, or a transcript line that carries a tool call or its result
+(`tool_use`, `tool_result` and the equivalents). A prompt saying "never read
+`.env`" is not an exposure — and since a transcript holds every prompt
+verbatim, that restriction has to hold there too. A snapshot from an adapter
+whose lines carry none of those markers is scanned without the path rules
+rather than with them: quieter, and stated here rather than discovered.
+
+Scanning is bounded — 50 000 characters per field, per transcript line and per
+tool input, 20 findings per record, 1 000 per session shared between the event
+and transcript passes — and a session that hit a cap is reported, never
+silently clipped. A command is read up to 4 000 characters; written file
+content gets the full 50 000, because a suppression marker can sit anywhere in
+a file.
+
+**2. Security activity.** Tool calls that ran a security tool, by category:
+
+| Category | Recognised tools |
+|---|---|
+| `sast` | semgrep, bandit, codeql, sonar-scanner, gosec, brakeman, njsscan, `snyk code` |
+| `sca` | osv-scanner, `npm/yarn/pnpm audit`, pip-audit, safety, `cargo audit`, `bundle audit`, `composer audit`, govulncheck, retire, dependency-check, `trivy fs\|repo\|sbom`, `snyk test` |
+| `secrets` | gitleaks, trufflehog, detect-secrets, ggshield, git-secrets |
+| `iac` | checkov, tfsec, terrascan, kube-score, kubesec, kube-bench, hadolint, conftest, `trivy config` |
+| `container` | `trivy image`, grype, dockle, `docker scout` |
+| `dast` | nuclei, nikto, zap, sqlmap, testssl.sh |
+| `supply-chain` | syft, cosign, cyclonedx, pip-licenses, license-checker |
+| `review` | `pre-commit run`; GAIDE's `scripts/check-*.sh`, the `security-reviewer` skill and `/security-review` |
+| `suppression` | inline `# nosemgrep` / `# nosec` / `# noqa: S…` / `# trivy:ignore` / `# checkov:skip` written into a file, edits to `.semgrepignore` / `.gitleaksignore` / `.trivyignore` / `.snyk`, `git commit --no-verify`, `SKIP=` on pre-commit |
+
+Only the invoked command counts: a scanner named in a prompt, in an assistant
+message or inside a file that was read is not an action. The outcome is
+`error` for a failed call, `clean` or `findings` when the response says so
+plainly, and `unknown` otherwise — never guessed. **Suppressions are a
+category of their own and are never counted as security activity**
+(Constitution Principle 10). The GAIDE entries are a separate table in the
+code: nothing in this analysis requires GAIDE.
+
+**Coverage.** A session counts as *code-touching* when it ran a file-writing
+tool — `Write`, `Edit`, `MultiEdit`, `NotebookEdit`, `write_file`,
+`create_file`, `edit_file`, `replace_file_content`, `apply_patch`,
+`str_replace_editor` — or a `git commit`, `git apply`, `git am` or `patch -pN`
+command. An adapter whose tool names are not in that list leaves its sessions
+out of the *denominator*, so coverage reads "0 of 0" rather than reporting a
+gap: if a project shows no code-touching sessions at all, suspect the
+catalogue before concluding it changed no code. Coverage is how many of those sessions carry any
+security action (and how many carry SAST, a dependency scan, a secret scan);
+the ones that carry none are listed as gaps.
+
+**What it cannot see — state this wherever the numbers are quoted:**
+
+- Event text was already redacted at capture (D5), so most credentials never
+  reach the ledger; the `[REDACTED]` markers count what redaction caught.
+  Transcript snapshots are raw by design, which is where an unredacted value
+  does appear.
+- Only what an agent session ran is in the ledger. A scanner in CI, in a
+  pre-commit hook, or run by hand outside a session is invisible here: "no
+  activity" means "none recorded", not "none happened".
+- Detection is pattern-based, with false positives and false negatives. A
+  finding is a pointer to look at, never a verdict.
+
+**Custom terms** are literal, case-insensitive keywords (4–64 characters, at
+most 100 per project, `project: ""` for every project) that mark internal or
+proprietary content. They are never compiled as patterns. They apply to
+arriving data immediately; stored findings only change on a rescan, and until
+then the console says the analysis is stale. Do not paste a live secret as a
+term: terms are stored as written.
+
+**Term limits.** At most 100 terms per project, and a term stored for *all*
+projects spends every project's budget, so the effective list a project is
+scanned against never exceeds 100.
+
+**Rescan:** `POST /api/v1/security/rescan` (or
+`python3 server/gaide_trace_server.py scan-security [--project NAME]`) re-runs
+the analysis over stored data. One job at a time, in the background, one
+session per transaction so it never holds the writer against live ingest.
+
 ## 8. Security notes
 
 - **Always front with TLS** for anything beyond localhost — passwords and
@@ -387,6 +498,18 @@ through `PUT /api/v1/models/prices` like a hand edit, with the admin as author.
   add data, never read it).
 - Give hooks `agent` keys where possible: an exfiltrated agent key can only
   *add* data, never read it.
+- The console's **Security** page reports exposure already present in the
+  store (§7.2). It stores pointers, never values — but it is also a map of
+  where the sensitive material is. It obeys the same project scope as every
+  other read, and custom terms and rescans are admin-only. Note that scope is
+  a property of *console accounts*: a `member` **API key** is unscoped, so it
+  reads that map for every project. Issue those sparingly.
+- An `agent` key may replace the transcript snapshot of any session id
+  (ingest is deliberately unscoped — see ADR 0002), which also replaces that
+  session's transcript findings. The snapshot overwrite already destroys the
+  underlying evidence, so this grants no new power, but it means an
+  exfiltrated agent key can erase a session's exposure findings as well as its
+  transcript.
 - The event layer is redacted at capture (see `docs/ARCHITECTURE.md` D5);
   transcript snapshots are raw by design — treat the server's data directory
   with the same care as the code it describes, and apply your institution's

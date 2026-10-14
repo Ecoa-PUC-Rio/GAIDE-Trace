@@ -371,7 +371,7 @@ start, progress and last result, including a failure (Principle 8).
 
 ## Task 18 — Console: the Security page
 
-**Status:** pending
+**Status:** done
 
 **Files:** `server/webui/security.js`, `server/webui/app.js`,
 `server/webui/index.html`, `server/webui/style.css`
@@ -382,9 +382,9 @@ rule, recurring-value, affected-session, tool, gap and suppression tables; the
 shared project/date filter.
 
 **Done when:**
-- [ ] Both halves render against a seeded server and match the API
-- [ ] Charts follow the console's conventions, each with its table (AC32)
-- [ ] Empty states read sensibly (AC12 of the spec's use case 12)
+- [x] Both halves render against a seeded server and match the API
+- [x] Charts follow the console's conventions, each with its table (AC32)
+- [x] Empty states read sensibly (AC12 of the spec's use case 12)
 
 **Estimate:** ~90 min · **Depends on:** Task 13
 
@@ -392,7 +392,7 @@ shared project/date filter.
 
 ## Task 19 — Console: session section, admin controls, honest limits
 
-**Status:** pending
+**Status:** done
 
 **Files:** `server/webui/app.js`, `server/webui/security.js`,
 `server/webui/style.css`
@@ -403,9 +403,9 @@ capture, no CI visibility) plus stale and truncated badges. No per-person
 ranking anywhere.
 
 **Done when:**
-- [ ] The session section shows findings and actions (AC29)
-- [ ] A member sees no terms editor and no rescan control (AC31)
-- [ ] The limits note is present on both halves, including when empty (AC30)
+- [x] The session section shows findings and actions (AC29)
+- [x] A member sees no terms editor and no rescan control (AC31)
+- [x] The limits note is present on both halves, including when empty (AC30)
 
 **Estimate:** ~60 min · **Depends on:** Tasks 17, 18
 
@@ -433,7 +433,7 @@ only on derivation/rescan).
 
 ## Task 21 — Documentation and reviews
 
-**Status:** pending
+**Status:** in-progress (docs done; code + security reviews closed, verifier pass outstanding)
 
 **Files:** `docs/SERVER.md`, `README.md`, `docs/adr/0003-*.md`, `PROGRESS.md`
 
@@ -444,9 +444,10 @@ passes: `code-reviewer`, the mandatory `security-reviewer`, and an independent
 `verifier` pass over the acceptance criteria and the sprint contract.
 
 **Done when:**
-- [ ] `docs/SERVER.md` and `README.md` updated (AC34)
-- [ ] ADR 0003 accepted
-- [ ] All three review passes closed with no open finding and no suppression
+- [x] `docs/SERVER.md` and `README.md` updated (AC34)
+- [x] ADR 0003 accepted
+- [x] Code review and security review closed: 4 blockers + 14 suggestions fixed, no suppression
+- [ ] Independent `verifier` pass
 - [ ] `./init.sh` green; `PROGRESS.md` entry appended
 
 **Estimate:** ~90 min · **Depends on:** Tasks 18, 19, 20
@@ -460,7 +461,7 @@ passes: `code-reviewer`, the mandatory `security-reviewer`, and an independent
 | AC1 (everything scanned) | 3, 7, 8, 12 | done (tests green) |
 | AC2 (rule catalogue) | 2, 3, 4 | done (tests green) |
 | AC3 (finding fields) | 3, 5, 6 | done (tests green) |
-| AC4 (severities) | 3, 21 | pending |
+| AC4 (severities) | 3, 21 | done (tests + docs) |
 | AC5 (repeats collapse) | 3 | done (tests green) |
 | AC6 (idempotent, snapshots intact) | 8, 12 | done (tests green) |
 | AC7 (check digits / Luhn) | 4 | done (tests green) |
@@ -484,13 +485,13 @@ passes: `code-reviewer`, the mandatory `security-reviewer`, and an independent
 | AC25 (terms are literal) | 16 | done (tests green) |
 | AC26 (bounded scanning) | 3, 8, 13 | done (tests green) |
 | AC27 (ingest survives a scan failure) | 7 | done (tests green) |
-| AC28 (Security page) | 18 | pending |
-| AC29 (session page) | 19 | pending |
-| AC30 (stated limits) | 19 | pending |
-| AC31 (admin-only controls, no ranking) | 19 | pending |
-| AC32 (chart conventions) | 18 | pending |
+| AC28 (Security page) | 18 | done (verified by hand) |
+| AC29 (session page) | 19 | done (verified by hand) |
+| AC30 (stated limits) | 19 | done (verified by hand) |
+| AC31 (admin-only controls, no ranking) | 19 | done (verified by hand) |
+| AC32 (chart conventions) | 18 | done (verified by hand) |
 | AC33 (upgrade scan) | 12 | done (tests green) |
-| AC34 (documentation) | 21 | pending |
+| AC34 (documentation) | 21 | done |
 
 > A criterion reaches `verified` only when exercised against the running
 > application by someone other than its implementer, not by green unit tests.

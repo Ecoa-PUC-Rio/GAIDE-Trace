@@ -133,8 +133,11 @@ store before any network I/O, then shipped through an offline-safe outbox
 (at-least-once, deduped server-side) — a down server can never lose data.
 The server keeps a raw JSONL archive as the source of truth plus a SQLite
 index, and serves a web console at `/` with a team dashboard, per-session
-timelines, transcript downloads, filtered JSONL/CSV exports, and API key
-management (roles: `agent` = ingest-only for hooks, `member`, `admin`).
+timelines, transcript downloads, filtered JSONL/CSV exports, a **Security**
+page (what potentially confidential material the ledger holds, and which
+security activity — SAST, SCA, secret scanning, IaC checks, reviews — actually
+happened in the sessions that changed code), and API key management (roles:
+`agent` = ingest-only for hooks, `member`, `admin`).
 
 Deployment (container with automatic TLS, or bare VPS with systemd + Caddy),
 backups and the HTTP API are documented in [`docs/SERVER.md`](docs/SERVER.md).
@@ -165,6 +168,11 @@ The event schema is documented in `schema/event.schema.json`.
 - If sessions may contain personal data of third parties, treat the store as
   research data: apply your institution's ethics/consent requirements before
   sharing.
+- The team server analyses what it already stores for exposure (credentials,
+  sensitive paths, personal data) so it can be found and remediated. The
+  analysis records *pointers* — a rule, a location, masked evidence and a
+  salted fingerprint — and never the matched value
+  (see "Security analysis" in [docs/SERVER.md](docs/SERVER.md)).
 
 ## Design notes
 
