@@ -2,6 +2,10 @@
 
 **A research-grade interaction ledger for AI-assisted development.**
 
+https://github.com/user-attachments/assets/c0956bbe-dabb-458e-a6f9-eee3357ed6f2
+
+*If the player above does not load, the same recording is at [`docs/assets/gaide-trace-presentation.mp4`](docs/assets/gaide-trace-presentation.mp4).*
+
 GAIDE-Trace captures a complete, analyzable history of every interaction
 between a developer and an AI coding agent in a project: prompts, model
 responses, tool calls, subagent activity, and full session transcripts —
