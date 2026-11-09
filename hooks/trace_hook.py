@@ -70,22 +70,132 @@ CANONICAL_EVENTS = {
 }
 
 # ---------------------------------------------------------------- redaction
+#
+# Spec: specs/capture-redaction/spec.md (issue #3). Two facts shape the rules:
+#
+# 1. redact() runs on text that clean() has already JSON-serialized, so a shell
+#    command such as   curl -H "Authorization: Bearer <jwt>"   arrives as
+#    curl -H \"Authorization: Bearer <jwt>\"  and every quoting rule has to
+#    accept a backslash-escaped quote, and must not swallow the backslash, or
+#    the stored field stops being valid JSON.
+# 2. An HTTP scheme sits between the key and the credential
+#    (Authorization: Bearer <token>), so a plain key/value rule sees the
+#    6-letter scheme name, not the token.
+#
+# Rules are biased toward false positives: masking a harmless word costs one
+# token of research data, missing a credential ships it to a shared server.
+# Context (key name, scheme) is kept and only the value is masked, so analyses
+# still see that a credential was used and how. All patterns are linear
+# (bounded quantifiers, no nested unbounded ones) so a hostile payload cannot
+# stall the hook (D4); redaction runs before truncation, on the whole field.
+
+_KEYWORD = r"(?:api[_-]?key|secret|token|password|passwd|authorization|bearer)"
+# `AWS_SECRET_ACCESS_KEY`, `password_hash`: the keyword may carry a suffix, as
+# long as it starts with _ or - so that `secretary:` stays prose. The suffix is
+# bounded: unbounded, every keyword inside one long `token_token_…` run would
+# scan to the end of the run and the rule went quadratic (D4).
+_KEY_SUFFIX = r"(?:[_-][A-Za-z0-9_-]{0,32})?"
+# A quote as the serializer may have left it: `"`, `\"` (one level of JSON
+# escaping) or `\\\"` (a quote the user had already escaped in the shell).
+_Q = r"\\*"
+# Whitespace, including a serialized tab or newline (`\t`, `\n`).
+_WS = r"(?:\s|\\[tn])*"
+_WS1 = r"(?:\s|\\[tn])+"
+# Schemes masked wherever they appear (RFC 7235 token68 credentials)...
+_SCHEME = r"(?:bearer|basic|negotiate|ntlm)"
+# ...and the wider set accepted between an `Authorization`-style key and its
+# value, where the context leaves no doubt (`Authorization: Token <opaque>`).
+_OPT_SCHEME = r"(?:(?:bearer|basic|negotiate|ntlm|token|apikey|api-key|digest)" + _WS1 + r")?"
+# RFC 7235 token68, required to look like a credential (a digit, a token68
+# symbol, or a lowercase-to-uppercase transition) so that prose such as
+# "Basic Authentication" is left alone. The transition check opts out of the
+# pattern-wide (?i), which would otherwise make it match any two letters.
+# Once it looks like one, the credential runs to whitespace or a quote
+# (`abc12345|rest` is masked whole), never ending on an escaped quote's
+# backslash, so the stored JSON stays intact.
+_TOKEN68 = (r"(?=[A-Za-z0-9._~+/=-]*(?:[0-9._~+/=-]|(?-i:[a-z][A-Z])))"
+            r"[A-Za-z0-9._~+/-]{8,}[^\s\"']*(?<!\\)")
+# A value that is already the marker is skipped, so redaction is idempotent.
+_NOT_MARK = r"(?!" + _OPT_SCHEME + r"\[REDACTED\])"
+# A JSON number (`0.00012345`, `-12345678`, `1.5e-10`) under a sensitive key is
+# a count or a price, and masking it without quotes would break the record.
+_NOT_NUMBER = r"(?!-?\d+(?:\.\d+)?(?:e[-+]?\d+)?(?![^\s\"',;{}\[\]]))"
+# A quoted value may be long (SAML assertions, Kerberos blobs); the bound only
+# caps what one keyword occurrence can cost when its closing quote is missing.
+_MAX_QUOTED = 8192
+
+
+def _quoted(name, opening, terminator):
+    """A quoted value: `opening` (a group) then up to _MAX_QUOTED characters
+    that are not the `terminator`, then the terminator itself."""
+    return (r"(?P<" + name + r">" + opening + r")" + _NOT_MARK
+            + r"(?P<" + name + r"_scheme>" + _OPT_SCHEME + r")"
+            + r"(?:(?!" + terminator + r")[^\n]){8," + str(_MAX_QUOTED) + r"}"
+            + r"(?P<" + name + r"_end>" + terminator + r")")
+
+
+# Quote forms the serializer produces, each with the only terminator that
+# matches its depth:
+#  * depth 0 `"` (a JSON string of the record itself) ends at a `"` preceded
+#    by an even run of backslashes (`\\"` closes, `\"` is a quote inside);
+#  * depth 1+ `\"` (a quote inside a serialized command) ends at a `"` carrying
+#    exactly the opening's backslashes and nothing more, so a `\\\"` inside
+#    the value does not end it;
+#  * `'` is never escaped by the serializer; a `'` with any backslash before
+#    it is kept inside the value (over-masking beats a leak, rule 6).
+_EVEN_BS = r"(?<!\\)(?:\\\\)*"
+_DQ0 = _quoted("dq0", r"(?<!\\)\"", _EVEN_BS + r"\"")
+_DQ1 = _quoted("dq1", r"(?<!\\)(?P<dq1_bs>(?:\\\\)*\\)\"", r"(?<!\\)(?P=dq1_bs)\"")
+_SQ = _quoted("sq", r"(?<!\\)'", r"(?<!\\)'")
+
+# key/value: `<keyword>[suffix] [quote] <sep> [quote] [scheme] <value> [quote]`
+# A quoted value runs to its closing quote, so punctuation, escaped quotes or
+# backslashes inside the credential (`it's`, `a,b`, `x\"y`) cannot end the
+# match early. A bare value runs to whitespace or a quote, never ending on the
+# backslash of an escaped quote, is never a JSON number, and its first
+# non-digit character must be credential-like (no JSON delimiter).
+KEY_VALUE_PATTERN = re.compile(
+    r"(?i)(?P<key>" + _KEYWORD + _KEY_SUFFIX + r")"
+    r"(?P<sep>" + _Q + r"[\"']?" + _WS + r"[:=]" + _WS + r")"
+    r"(?:" + _DQ0 + r"|" + _DQ1 + r"|" + _SQ + r"|"
+    + _NOT_MARK + _NOT_NUMBER + r"(?P<bare_scheme>" + _OPT_SCHEME + r")"
+    + r"(?=\d*[^\d\s\"',;{}\[\]\\])[^\s\"']{8,}(?<!\\)"
+    r")")
+
+AUTH_SCHEME_PATTERN = re.compile(r"(?i)\b(" + _SCHEME + r")(" + _WS1 + r")" + _NOT_MARK + _TOKEN68)
 
 SECRET_PATTERNS = [
-    re.compile(r"(?i)(api[_-]?key|secret|token|password|passwd|authorization|bearer)"
-               r"(\"?\s*[:=]\s*\"?)([^\s\"',;]{8,})"),
+    # JWT, twin of the server's `jwt` scan rule. The lookbehind, not \b, is the
+    # start anchor: `-` is both a word boundary and a member of the class, so
+    # with \b a run like `-eyJ-eyJ-eyJ…` gave every `eyJ` a fresh start and the
+    # scan went quadratic (D4).
+    re.compile(r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}"),
     re.compile(r"sk-[A-Za-z0-9_-]{20,}"),                    # OpenAI/Anthropic-style keys
     re.compile(r"ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"),  # GitHub
     re.compile(r"AKIA[0-9A-Z]{16}"),                          # AWS access key id
-    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"),
+    # A key block runs to its END marker or, when the capture was cut before
+    # one (`head -5 id_rsa`), to the end of its JSON string (an unescaped `"`)
+    # or of the text: a truncated key is still a key, and the sibling fields
+    # of the record survive. Tempered, so each character is consumed once (D4).
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----(?:(?!-----END |(?<!\\)\")[\s\S])*"
+               r"(?:-----END [A-Z ]*PRIVATE KEY-----)?"),
 ]
 
 
 def redact(text: str) -> str:
-    def _kv(m):
+    def _keep_context(m):
+        g = m.groupdict(default="")
+        opening = (g["dq0"] + g["dq0_scheme"] + g["dq1"] + g["dq1_scheme"]
+                   + g["sq"] + g["sq_scheme"] + g["bare_scheme"])
+        closing = g["dq0_end"] + g["dq1_end"] + g["sq_end"]
+        return g["key"] + g["sep"] + opening + "[REDACTED]" + closing
+
+    def _keep_scheme(m):
         return m.group(1) + m.group(2) + "[REDACTED]"
-    text = SECRET_PATTERNS[0].sub(_kv, text)
-    for pat in SECRET_PATTERNS[1:]:
+
+    text = KEY_VALUE_PATTERN.sub(_keep_context, text)
+    text = AUTH_SCHEME_PATTERN.sub(_keep_scheme, text)
+    for pat in SECRET_PATTERNS:
         text = pat.sub("[REDACTED]", text)
     return text
 

@@ -17,6 +17,16 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 
 
+def load_hook():
+    """Import hooks/trace_hook.py as a module. Like the server it is a single
+    file copied as-is into target projects, never a package."""
+    spec = importlib.util.spec_from_file_location(
+        "trace_hook", REPO / "hooks" / "trace_hook.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def load_server():
     """Import server/gaide_trace_server.py as a module (it is a script, not a
     package — deployments copy the single file)."""
@@ -110,6 +120,8 @@ _FAKE_FRAGMENTS = {
     "vault_token": ("hv", "s.", "A1b2C3d4E5f6G7h8I9j0K1l2"),
     "private_key_header": ("-----BEGIN RSA ", "PRIVATE KEY", "-----"),
     "jwt": ("ey", "JhbGciOiJIUzI1NiJ9", ".", "eyJzdWIiOiJ0ZXN0LXVzZXIifQ", ".", "c2lnbmF0dXJl"),
+    "basic_credential": ("dXNlcjpz", "dXAzclMz", "Y3JldFZhbHVlNDI="),  # base64 of user:<password_value>
+    "opaque_token": ("f3a9", "0c1e", "7b2d", "4e8f", "a1b2", "c3d4"),
     "password_value": ("sup3r", "S3cret", "Value42"),
     "secret_body": ("A1b2", "C3d4E5f6", "G7h8I9j0"),
 }
